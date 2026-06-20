@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Fetch the N most recent items from an RSS 2.0 or Atom feed.
 
-Prints a compact, context-friendly summary to stdout: feed title followed
-by one block per item (index, title, date, link, short summary). All the
-bulky XML is parsed here so it never reaches the agent's context.
+Two modes, both parsing the feed here so the bulky XML never reaches the
+agent's context:
+
+* default (compact) — one short block per item (index, title, date, link,
+  ~280-char plain-text summary). Best for "show me the latest N items".
+* ``--full`` — full untruncated plain-text content per item, so the model
+  can reason over the feed (themes, which items mention X, etc.).
 
 Usage:
-    fetch_rss.py <FEED_URL> [N]
+    fetch_rss.py <FEED_URL> [-n N] [--full]
 
 N defaults to 5. Exit code is non-zero on fetch/parse failure, with a
 one-line error on stderr.
 """
 
+import argparse
 import html
 import re
 import sys
@@ -23,15 +28,15 @@ SUMMARY_CHARS = 280
 USER_AGENT = "agent99x-fetch_rss/1.0 (+https://example.invalid)"
 
 
-def strip_html(text: str) -> str:
-    """Collapse an HTML/escaped blurb into a short single line of plain text."""
+def strip_html(text: str, limit: int | None = SUMMARY_CHARS) -> str:
+    """Collapse an HTML/escaped blurb into plain text, optionally truncated."""
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", " ", text)
     text = html.unescape(text)
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > SUMMARY_CHARS:
-        text = text[:SUMMARY_CHARS].rstrip() + "…"
+    if limit is not None and len(text) > limit:
+        text = text[:limit].rstrip() + "…"
     return text
 
 
@@ -63,9 +68,10 @@ def atom_link(entry) -> str:
     return fallback
 
 
-def parse_items(root):
-    """Return a list of {title, link, date, summary} for RSS or Atom."""
+def parse_items(root, full: bool):
+    """Return (feed_title, items) for RSS or Atom. items carry plain-text summaries."""
     tag = localname(root.tag)
+    limit = None if full else SUMMARY_CHARS
     items = []
 
     if tag == "rss" or tag == "channel":
@@ -76,24 +82,28 @@ def parse_items(root):
         for it in channel:
             if localname(it.tag) != "item":
                 continue
+            # In full mode prefer content:encoded (full article) over description.
+            body = child_text(it, "encoded") if full else ""
+            body = body or child_text(it, "description")
             items.append({
                 "title": child_text(it, "title"),
                 "link": child_text(it, "link"),
                 "date": child_text(it, "pubDate"),
-                "summary": strip_html(child_text(it, "description")),
+                "summary": strip_html(body, limit),
             })
     elif tag == "feed":  # Atom
         feed_title = child_text(root, "title")
         for it in root:
             if localname(it.tag) != "entry":
                 continue
+            # In full mode prefer content (full entry) over summary.
+            body = child_text(it, "content") if full else ""
+            body = body or child_text(it, "summary") or child_text(it, "content")
             items.append({
                 "title": child_text(it, "title"),
                 "link": atom_link(it),
                 "date": child_text(it, "published") or child_text(it, "updated"),
-                "summary": strip_html(
-                    child_text(it, "summary") or child_text(it, "content")
-                ),
+                "summary": strip_html(body, limit),
             })
     else:
         raise ValueError(f"Unrecognised feed root <{tag}> (expected rss/feed)")
@@ -102,20 +112,20 @@ def parse_items(root):
 
 
 def main(argv):
-    if len(argv) < 2:
-        print("usage: fetch_rss.py <FEED_URL> [N]", file=sys.stderr)
-        return 2
-    url = argv[1]
-    n = DEFAULT_N
-    if len(argv) > 2:
-        try:
-            n = max(1, int(argv[2]))
-        except ValueError:
-            print(f"N must be an integer, got {argv[2]!r}", file=sys.stderr)
-            return 2
+    parser = argparse.ArgumentParser(
+        prog="fetch_rss.py",
+        description="Fetch the N most recent items from an RSS/Atom feed.",
+    )
+    parser.add_argument("url", help="Feed URL (RSS 2.0 or Atom).")
+    parser.add_argument("-n", "--num", type=int, default=DEFAULT_N,
+                        help=f"Number of items (default {DEFAULT_N}).")
+    parser.add_argument("--full", action="store_true",
+                        help="Emit full untruncated item content for reasoning.")
+    args = parser.parse_args(argv[1:])
+    n = max(1, args.num)
 
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        req = urllib.request.Request(args.url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read()
     except Exception as e:  # noqa: BLE001 - report any fetch failure cleanly
@@ -124,14 +134,15 @@ def main(argv):
 
     try:
         root = ET.fromstring(raw)
-        feed_title, items = parse_items(root)
+        feed_title, items = parse_items(root, args.full)
     except Exception as e:  # noqa: BLE001
         print(f"parse failed: {e}", file=sys.stderr)
         return 1
 
     items = items[:n]
     print(f"Feed: {feed_title or '(untitled)'}")
-    print(f"Showing {len(items)} of most recent items\n")
+    print(f"Showing {len(items)} of most recent items"
+          f"{' (full content)' if args.full else ''}\n")
     for i, it in enumerate(items, 1):
         print(f"{i}. {it['title'] or '(untitled)'}")
         if it["date"]:

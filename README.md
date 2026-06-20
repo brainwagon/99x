@@ -128,8 +128,7 @@ Project-local skills shadow global ones (same precedence as agents).
 |---|---|
 | `weather` | Current conditions + 5-day forecast via open-meteo.com (no API key). |
 | `web_search` | Search via DuckDuckGo HTML endpoint (no API key). |
-| `fetch_rss` | Parse and summarise RSS/Atom feeds. |
-| `fetch_recent_rss` | Fetch the N most recent RSS/Atom items (default 5) via a bundled `scripts/fetch_rss.py`, keeping raw XML out of context. |
+| `fetch_recent_rss` | Fetch the N most recent RSS/Atom items (default 5) via a bundled `scripts/fetch_rss.py`, keeping raw XML out of context; `--full` pulls full item content for reasoning. |
 | `grill-me` | Interview the user relentlessly about a plan or design. |
 
 ## Agents (Subagents)
@@ -355,7 +354,6 @@ agent99x/                   # Python package (flat)
     skills/
       weather/SKILL.md
       web_search/SKILL.md
-      fetch_rss/SKILL.md
       fetch_recent_rss/         # SKILL.md + scripts/fetch_rss.py
       grill-me/SKILL.md
 ```
