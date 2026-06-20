@@ -74,16 +74,17 @@ def _linkify(text: str) -> str:
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 _BANNER = "\n".join([
-    " ██████   ██████ ",
-    "██    ██ ██    ██",
-    "██    ██ ██    ██",
-    " ███████  ███████",
-    "      ██       ██",
-    "      ██       ██",
-    " ██████   ██████ ",
+    "        ██        ██        ",
+    "          ██    ██          ",
+    "        ██████████████      ",
+    "      ████  ██████  ████    ",
+    "    ██████████████████████  ",
+    "    ██  ██████████████  ██  ",
+    "    ██  ██          ██  ██  ",
+    "          ████  ████        ",
 ])
 
-_BANNER_COLORS = ["#ff5f87", "#ff8700", "#ffd700", "#5fd7af", "#5fafff", "#af87ff", "#ff5fd7"]
+_BANNER_COLORS = ["#3aff3a"] * 8
 _BANNER_CREDIT = [
     "",
     "",
@@ -91,6 +92,7 @@ _BANNER_CREDIT = [
     "",
     "  Created by Mark VandeWettering",
     "  <mvandewettering@gmail.com>  ·  2026",
+    "",
     "",
 ]
 
