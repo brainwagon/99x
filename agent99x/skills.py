@@ -1,7 +1,13 @@
-"""Skill and agent discovery tools, plus synchronous subagent dispatch."""
+"""Skill and agent discovery tools, plus synchronous subagent dispatch.
+
+These are the *bridge* tools that surface the three-kind capability model:
+``list_tools`` / ``list_skills`` / ``list_agents`` (discovery) and
+``load_skill`` / ``spawn_agent`` (invocation). All are registered with
+``group="meta"`` so the eager catalog hides them (the capabilities primer
+covers them); ``list_tools`` still reports them.
+"""
 
 import os
-import subprocess
 from typing import Any, Dict, List, Optional
 
 from agent99x import providers
@@ -9,14 +15,22 @@ from agent99x import scopes
 from agent99x import tools
 from agent99x.config import MAX_AGENT_DEPTH
 from agent99x.prompt import _skill_meta, build_agent_system, parse_frontmatter
-from agent99x.session import AGENT_HOME, SessionConfig
+from agent99x.session import SessionConfig
 from agent99x.tools import tool
 
 
-# ── skill discovery ────────────────────────────────────────────────
+# ── discovery (symmetric across the three kinds) ────────────────────
+
+@tool("list_tools", "List every callable tool by name, description, and group.",
+      doc="The exhaustive list behind the curated tool catalog in your prompt.",
+      group="meta")
+def list_tools() -> Dict[str, Any]:
+    return {"tools": tools.tool_listing()}
+
 
 @tool("list_skills", "List available skills by name and description.",
-      doc="Call when you need a capability you don't know how to perform.")
+      doc="Call when you need a capability you don't know how to perform.",
+      group="meta")
 def list_skills() -> Dict[str, Any]:
     results: List[Dict[str, str]] = []
     for name, path in scopes.discover("skills"):
@@ -26,59 +40,22 @@ def list_skills() -> Dict[str, Any]:
 
 
 @tool("load_skill", "Load full instructions for a named skill.",
-      params={"name": {"type": "string", "description": "Skill name (from list_skills), e.g. 'weather'"}})
+      params={"name": {"type": "string", "description": "Skill name (from list_skills), e.g. 'weather'"}},
+      doc="Returns the skill's instructions plus its directory ('dir'). If the "
+          "instructions reference bundled scripts (e.g. scripts/x.py), run them "
+          "with run_bash from that dir.",
+      group="meta")
 def load_skill(name: str) -> Dict[str, Any]:
     path = scopes.resolve("skills", name)
     if not path:
         return {"error": f"Unknown skill: {name}. Call list_skills to see available skills."}
     _desc, body = _skill_meta(path)
-    return {"skill": name, "content": body}
-
-
-@tool(
-    "run_skill_script",
-    "Run a helper script bundled with a skill.",
-    params={
-        "skill": {"type": "string", "description": "Skill name (same as the skills/ subdirectory name)."},
-        "script": {"type": "string", "description": "Script filename inside the skill's scripts/ directory, e.g. 'post.py'."},
-        "args": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Command-line arguments to pass to the script.",
-        },
-    },
-)
-def run_skill_script(skill: str, script: str,
-                     args: Optional[List[str]] = None) -> Dict[str, Any]:
-    skill_md = scopes.resolve("skills", skill)
-    scripts_dir = (os.path.join(os.path.dirname(skill_md), "scripts") if skill_md
-                   else os.path.join(AGENT_HOME, "skills", skill, "scripts"))
-    script_path = os.path.join(scripts_dir, script)
-    real_scripts_dir = os.path.realpath(scripts_dir)
-    try:
-        real_script = os.path.realpath(script_path)
-    except OSError as e:
-        return {"error": str(e)}
-    if not real_script.startswith(real_scripts_dir + os.sep):
-        return {"error": f"Script path escapes skill directory: {script!r}"}
-    if not os.path.isfile(real_script):
-        return {"error": f"Script not found: {script!r} in skill {skill!r}"}
-    try:
-        result = subprocess.run(
-            [real_script] + (args or []),
-            capture_output=True, text=True, timeout=60,
-        )
-        return {"returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr}
-    except subprocess.TimeoutExpired:
-        return {"error": "script timed out (60s)"}
-    except OSError as e:
-        return {"error": str(e)}
+    return {"skill": name, "content": body, "dir": os.path.dirname(path)}
 
 
 @tool("list_agents", "List available agents by name and description.",
-      doc="Call before spawn_agent if you don't know which agent to use.")
+      doc="Call before spawn_agent if you don't know which agent to use.",
+      group="meta")
 def list_agents() -> Dict[str, Any]:
     results: List[Dict[str, str]] = []
     for name, path in scopes.discover("agents"):
@@ -103,6 +80,7 @@ def list_agents() -> Dict[str, Any]:
         "name": {"type": "string", "description": "Agent name (subdirectory of agents/). Call list_agents to see options. Omit for default."},
     },
     required=["task"],
+    group="meta",
     needs_session=True,
 )
 def spawn_agent(task: str, name: Optional[str] = None,

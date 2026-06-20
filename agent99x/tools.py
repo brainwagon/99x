@@ -33,6 +33,15 @@ from agent99x import todos as todo_md
 
 TOOLS: List[Dict[str, Any]] = []
 TOOL_HANDLERS: Dict[str, Callable[..., Any]] = {}
+TOOL_GROUPS: Dict[str, str] = {}  # tool name -> family ("files", "shell", ..., "meta")
+
+# Catalog rendering order and labels. "meta" is the sentinel for "hide from the
+# eager catalog"; anything unmapped (e.g. MCP tools) falls into "other".
+GROUP_ORDER = ["files", "shell", "search", "net", "plan", "info"]
+GROUP_LABELS = {
+    "files": "Files", "shell": "Shell", "search": "Search",
+    "net": "Network", "plan": "Planning", "info": "Info", "other": "Other",
+}
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,7 @@ def tool(
     params: Optional[Dict[str, Any]] = None,
     required: Optional[List[str]] = None,
     doc: Optional[str] = None,
+    group: str = "other",
     needs_session: bool = False,
     plan_safe: bool = True,
     mutates: bool = False,
@@ -89,14 +99,14 @@ def tool(
     traits = ToolTraits(needs_session=needs_session, plan_safe=plan_safe, mutates=mutates)
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-        register(schema, fn, traits=traits)
+        register(schema, fn, traits=traits, group=group)
         return fn
 
     return decorator
 
 
 def register(schema: Dict[str, Any], handler: Callable[..., Any], *,
-             traits: Optional[ToolTraits] = None) -> None:
+             traits: Optional[ToolTraits] = None, group: str = "other") -> None:
     """Record a tool's schema, handler, and traits. The single registration path
     for both the @tool decorator and runtime registrars (e.g. MCP)."""
     name = schema["function"]["name"]
@@ -107,6 +117,50 @@ def register(schema: Dict[str, Any], handler: Callable[..., Any], *,
         TOOLS[existing] = schema
     TOOL_HANDLERS[name] = handler
     TOOL_TRAITS[name] = traits or _DEFAULT_TRAITS
+    TOOL_GROUPS[name] = group
+
+
+def tool_catalog(allowed: Optional[set] = None) -> str:
+    """Terse, grouped catalog of callable tools (names only).
+
+    Descriptions live in the JSON schemas already sent to the model, so this
+    only anchors which tools exist and their families. Hides group="meta"
+    (bridge tools, covered by the capabilities primer). If ``allowed`` is given,
+    only those tool names are shown (used for tool-restricted subagents).
+    """
+    buckets: Dict[str, List[str]] = {}
+    for schema in TOOLS:
+        name = schema["function"]["name"]
+        if allowed is not None and name not in allowed:
+            continue
+        grp = TOOL_GROUPS.get(name, "other")
+        if grp == "meta":
+            continue
+        buckets.setdefault(grp, []).append(name)
+    order = GROUP_ORDER + [g for g in buckets if g not in GROUP_ORDER]
+    lines: List[str] = []
+    for g in order:
+        if g in buckets:
+            label = GROUP_LABELS.get(g, g.capitalize())
+            lines.append(f"- {label}: {', '.join(buckets[g])}")
+    return "\n".join(lines)
+
+
+def tool_listing() -> List[Dict[str, str]]:
+    """Exhaustive list of every registered tool: name, description, group.
+
+    Includes meta/bridge tools and runtime-added (MCP) tools — the full truth
+    behind the curated eager catalog. Backs the ``list_tools`` tool.
+    """
+    out: List[Dict[str, str]] = []
+    for schema in TOOLS:
+        fn = schema["function"]
+        out.append({
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+            "group": TOOL_GROUPS.get(fn["name"], "other"),
+        })
+    return out
 
 
 # ── bash ───────────────────────────────────────────────────────────
@@ -168,7 +222,8 @@ def _bash_result(bufs: Dict[str, bytearray], truncated: Dict[str, bool], *,
     return out
 
 
-@tool("run_bash", "Run a bash command (30s timeout).", params={"command": "string"})
+@tool("run_bash", "Run a bash command (30s timeout).", params={"command": "string"},
+      group="shell")
 def run_bash(command: str) -> Dict[str, Any]:
     proc = subprocess.Popen(
         command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -271,7 +326,7 @@ def _rstrip_replace(content: str, old: str, new: str, replace_all: bool,
     return "".join(out), len(targets)
 
 
-@tool("read_file", "Read a file from disk.",
+@tool("read_file", "Read a file from disk.", group="files",
       params={
           "path": "string",
           "offset": {"type": "integer", "description": "Line number to start reading from (1-based)."},
@@ -306,6 +361,7 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
 
 @tool("write_file",
       "Write (overwrite) a file on disk. Prefer edit_file for targeted changes.",
+      group="files",
       params={"path": "string", "content": "string"},
       mutates=True, plan_safe=False)
 def write_file(path: str, content: str) -> Dict[str, Any]:
@@ -320,6 +376,7 @@ def write_file(path: str, content: str) -> Dict[str, Any]:
 @tool("edit_file",
       "Edit a file by replacing exact-match text. old_string must match uniquely "
       "(or pass replace_all=true). Tolerates CRLF/LF differences and trailing-whitespace drift.",
+      group="files",
       params={
           "path": "string",
           "old_string": {"type": "string",
@@ -379,6 +436,7 @@ def edit_file(path: str, old_string: str, new_string: str,
       "Replace a contiguous range of lines in a file by line number. Lines are 1-based, end is inclusive. "
       "More robust than edit_file for small models since there is no string to match. "
       "Use end=start-1 to insert before start without deleting anything.",
+      group="files",
       params={
           "path": "string",
           "start": {"type": "integer", "description": "First line to replace (1-based, inclusive)."},
@@ -425,6 +483,7 @@ def replace_lines(path: str, start: int, end: int, new_content: str) -> Dict[str
 
 @tool("patch",
       "Apply a unified diff (patch) to a file. Strict context matching is used.",
+      group="files",
       params={
           "path": "string",
           "diff": {"type": "string", "description": "The unified diff content to apply."},
@@ -543,6 +602,7 @@ def _grep_python(pattern: str, path: str, glob_pat: str) -> List[Dict[str, Any]]
 
 @tool("grep",
       "Search file contents for a regex. Returns up to 200 matches as {path,line,text}.",
+      group="search",
       params={
           "pattern": "string",
           "path": {"type": "string", "description": "Directory or file (default '.')."},
@@ -572,6 +632,7 @@ def grep(pattern: str, path: str = ".", glob: str = "*") -> Dict[str, Any]:
 
 @tool("glob",
       "Find files by glob pattern (e.g. '**/*.py'). Returns up to 500 paths.",
+      group="search",
       params={"pattern": "string", "path": "string"},
       required=["pattern"])
 def glob_files(pattern: str, path: str = ".") -> Dict[str, Any]:
@@ -604,6 +665,7 @@ def glob_files(pattern: str, path: str = ".") -> Dict[str, Any]:
 
 @tool("write_todos",
       "Replace the current todo list. Use to plan and track multi-step work; rewrite the whole list each call.",
+      group="plan",
       params={"todos": {
           "type": "array",
           "items": {
@@ -620,7 +682,7 @@ def write_todos(todos: List[Union[Dict[str, Any], str]]) -> Dict[str, Any]:
     return {"ok": True, "count": len(saved), "todos": saved}
 
 
-@tool("read_todos", "Read the current todo list.")
+@tool("read_todos", "Read the current todo list.", group="plan")
 def read_todos() -> Dict[str, Any]:
     return {"todos": todo_md.load()}
 
@@ -631,6 +693,7 @@ def read_todos() -> Dict[str, Any]:
       "Return the current date, time, and timezone. Pass an IANA timezone name "
       "(e.g. 'America/Los_Angeles', 'Europe/London', 'UTC') to get the time there; "
       "omit for local time. Use for date/time math instead of computing it yourself.",
+      group="info",
       params={"timezone": {"type": "string",
                            "description": "Optional IANA timezone name, e.g. 'America/Los_Angeles'."}},
       required=[])
@@ -663,6 +726,7 @@ _HTTP_BODY_CAP = 10_000_000
 
 @tool("http_request",
       "Make an HTTP request. Returns {status, headers, body, truncated}; body is capped at max_bytes (default 10MB).",
+      group="net",
       params={
           "url": "string",
           "method": {"type": "string", "description": "GET, POST, PUT, PATCH, DELETE, HEAD (default GET)."},

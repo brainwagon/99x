@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent99x import logs
 from agent99x import scopes
+from agent99x import tools
 from agent99x.session import SessionConfig, PROJECT_DIR
 
 MEMORY_FILE = "MEMORY.md"
@@ -44,7 +45,12 @@ def _parse_scalar(raw: str) -> Any:
 
 
 def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
-    """Split YAML-ish frontmatter from body. Returns ({}, text) when none."""
+    """Split YAML-ish frontmatter from body. Returns ({}, text) when none.
+
+    Handles flat ``key: value`` pairs and one level of nested map (an empty
+    value followed by indented ``key: value`` lines), so agentskills.io's
+    ``metadata:`` block parses into a dict. Deeper nesting is not supported.
+    """
     if not text.startswith("---\n") and not text.startswith("---\r\n"):
         return {}, text
     first_nl = text.find("\n") + 1
@@ -58,14 +64,35 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     if after < len(text) and text[after] == "\n":
         after += 1
     meta: Dict[str, Any] = {}
-    for line in block.splitlines():
+    lines = block.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if ":" not in stripped:
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
             continue
         key, _, value = stripped.partition(":")
-        meta[key.strip()] = _parse_scalar(value)
+        key = key.strip()
+        val = value.strip()
+        if val == "":
+            # Possibly a nested map: gather following indented "k: v" lines.
+            submap: Dict[str, Any] = {}
+            while i < len(lines):
+                nxt = lines[i]
+                if not nxt.strip():
+                    i += 1
+                    continue
+                if len(nxt) - len(nxt.lstrip()) == 0:
+                    break  # back to top level
+                sub = nxt.strip()
+                if ":" in sub:
+                    sk, _, sv = sub.partition(":")
+                    submap[sk.strip()] = _parse_scalar(sv)
+                i += 1
+            meta[key] = submap if submap else ""
+        else:
+            meta[key] = _parse_scalar(val)
     return meta, text[after:].lstrip("\n")
 
 
@@ -76,15 +103,28 @@ _SYSTEM_SUFFIX = (
     "Prefer edit_file over write_file for targeted changes; write_file is for new files or full rewrites. "
     "Prefer grep/glob over shelling out to grep/find via run_bash. "
     "For tasks with more than ~3 steps, call write_todos first to plan, then update statuses as you go. "
-    "Call load_skill(name) to load instructions for any skill listed above. "
-    "If a skill's instructions describe helper scripts, invoke them with run_skill_script(skill, script, args). "
-    "Call list_skills if no catalog is present. "
     "Never describe a tool call you are about to make — just make it. "
     "If more work remains, your reply MUST contain a tool call; "
     "only return plain text with no tool call when the task is fully complete. "
     "If your final text reply presents the user with choices and you have a recommendation, "
     "format the recommended choice exactly like this: [RECOMMENDED: <choice>]. "
     "The UI will parse this and automatically preload the input buffer for the user."
+)
+
+# Prescriptive primer that teaches the three-kind capability model. Prepended to
+# the catalogs in the "# YOUR CAPABILITIES" section. Keep it short — it's
+# always-on prompt.
+_CAPABILITIES_PRIMER = (
+    "You have three kinds of capability. Pick the right kind:\n"
+    "- **Tools** — code you run yourself, right now (read_file, run_bash, grep, …). "
+    "Call them directly. `list_tools` shows them all.\n"
+    "- **Skills** — written instructions for a procedure. When a task matches a skill below, "
+    "call `load_skill(name)` to load its steps, then carry them out in this conversation. "
+    "A skill may bundle scripts; `load_skill` returns its `dir`, so run any bundled script with "
+    "`run_bash` from that dir.\n"
+    "- **Agents** — fresh specialist workers. For a large, self-contained sub-task, "
+    "call `spawn_agent(task, name)`; the agent works in its own context and returns a result.\n"
+    "Decide by: do it yourself → tool; need the recipe → skill; hand it off → agent."
 )
 _PLAN_SUFFIX = (
     "You are in PLAN MODE. "
@@ -177,26 +217,58 @@ def _skill_mtime(path: str) -> float:
         return 0.0
 
 
-def _load_skills_catalog(session: SessionConfig) -> str:
-    """Render an inline catalog of available skills for the system prompt."""
+def _skills_catalog_lines(session: SessionConfig) -> List[str]:
+    """Full (name — description) catalog lines for available skills, cached."""
     cache = session.shared_state.setdefault("skills_catalog_cache", {})
     entries = scopes.discover("skills")
     if not entries:
-        return ""
+        return []
     sig = tuple((n, _skill_mtime(p)) for n, p in entries)
     cached = cache.get("merged")
     if cached and cached[0] == sig:
         return cached[1]
-    lines: List[str] = ["# AVAILABLE SKILLS", "",
-                        "Load with `load_skill(name)` when relevant to the user's request:"]
+    lines: List[str] = []
     for name, path in entries:
         desc, _body = _skill_meta(path)
         if not desc and not _body:
             continue
         lines.append(f"- {name}: {desc}" if desc else f"- {name}")
-    rendered = "\n".join(lines)
-    cache["merged"] = (sig, rendered)
-    return rendered
+    cache["merged"] = (sig, lines)
+    return lines
+
+
+def _agents_catalog_lines() -> List[str]:
+    """Full (name — description) catalog lines for available agents."""
+    lines: List[str] = []
+    for name, path in scopes.discover("agents"):
+        try:
+            with open(path, encoding="utf-8") as f:
+                meta, _body = parse_frontmatter(f.read())
+        except OSError:
+            continue
+        desc = str(meta.get("description") or "")
+        lines.append(f"- {name}: {desc}" if desc else f"- {name}")
+    return lines
+
+
+def _build_capabilities(session: SessionConfig,
+                        allowed: Optional[set] = None) -> str:
+    """The '# YOUR CAPABILITIES' section: primer + three catalogs.
+
+    Tools render terse (grouped names); skills/agents render full. ``allowed``
+    restricts the tools catalog for tool-restricted subagents.
+    """
+    parts: List[str] = ["# YOUR CAPABILITIES", _CAPABILITIES_PRIMER]
+    tool_cat = tools.tool_catalog(allowed)
+    if tool_cat:
+        parts.append("## Tools\n" + tool_cat)
+    skill_lines = _skills_catalog_lines(session)
+    if skill_lines:
+        parts.append("## Skills\n" + "\n".join(skill_lines))
+    agent_lines = _agents_catalog_lines()
+    if agent_lines:
+        parts.append("## Agents\n" + "\n".join(agent_lines))
+    return "\n\n".join(parts)
 
 
 def _runtime_paths_section(session: SessionConfig) -> str:
@@ -279,15 +351,13 @@ def build_system(session: SessionConfig) -> Dict[str, Any]:
     memory = _load_memory(session)
     proj_memory = _load_memory(session, PROJECT_MEMORY_MD)
     user_md = _load_memory(session, USER_MD_FILE)
-    skills = _load_skills_catalog(session)
     suffix = _PLAN_SUFFIX if session.plan_mode else _SYSTEM_SUFFIX
     parts = []
     if body:
         parts.append(body)
     if proj_body:
         parts.append("# PROJECT\n\n" + proj_body.strip())
-    if skills:
-        parts.append(skills)
+    parts.append(_build_capabilities(session))
     if user_md:
         parts.append("# USER\n\n" + user_md.strip())
     mem_sections = []
@@ -326,9 +396,9 @@ def build_agent_system(
     parts: List[str] = []
     if body:
         parts.append(body)
-    skills = _load_skills_catalog(session)
-    if skills:
-        parts.append(skills)
+    allowed = meta.get("allowed_tools")
+    allowed_set = set(allowed) if isinstance(allowed, list) else None
+    parts.append(_build_capabilities(session, allowed_set))
     if meta.get("inherit_memory"):
         memory = _load_memory(session)
         if memory:

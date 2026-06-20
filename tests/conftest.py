@@ -19,6 +19,24 @@ def in_tmp_cwd(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture
+def clean_registry():
+    """Isolate the global tool registry so test tools don't leak between tests."""
+    from agent99x import tools as registry
+    tools_snapshot = registry.TOOLS[:]
+    handlers_snapshot = dict(registry.TOOL_HANDLERS)
+    traits_snapshot = dict(registry.TOOL_TRAITS)
+    groups_snapshot = dict(registry.TOOL_GROUPS)
+    yield
+    registry.TOOLS[:] = tools_snapshot
+    registry.TOOL_HANDLERS.clear()
+    registry.TOOL_HANDLERS.update(handlers_snapshot)
+    registry.TOOL_TRAITS.clear()
+    registry.TOOL_TRAITS.update(traits_snapshot)
+    registry.TOOL_GROUPS.clear()
+    registry.TOOL_GROUPS.update(groups_snapshot)
+
+
 def _delta(**kw):
     return SimpleNamespace(**kw)
 

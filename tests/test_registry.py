@@ -4,23 +4,7 @@ The registry owns per-tool traits (needs_session, mutating, plan-safe) so
 the dispatcher can ask the registry instead of hardcoding tool-name sets.
 """
 
-import pytest
-
 from agent99x import tools as registry
-
-
-@pytest.fixture
-def clean_registry():
-    """Isolate the global registry so test tools don't leak between tests."""
-    tools_snapshot = registry.TOOLS[:]
-    handlers_snapshot = dict(registry.TOOL_HANDLERS)
-    traits_snapshot = dict(getattr(registry, "TOOL_TRAITS", {}))
-    yield
-    registry.TOOLS[:] = tools_snapshot
-    registry.TOOL_HANDLERS.clear()
-    registry.TOOL_HANDLERS.update(handlers_snapshot)
-    registry.TOOL_TRAITS.clear()
-    registry.TOOL_TRAITS.update(traits_snapshot)
 
 
 def test_default_traits_are_safe(clean_registry):
