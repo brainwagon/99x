@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent99x"
+version = "0.1.0"
+description = "A streamlined local-LLM coding agent (revised agent99)."
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",
+    "textual>=8.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+
+[project.scripts]
+99x   = "agent99x.cli:main_tui"
+99xsh = "agent99x.cli:main_oneshot"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent99x*"]
+
+[tool.setuptools.package-data]
+agent99x = ["_defaults/**/*", "_defaults/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
