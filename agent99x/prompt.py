@@ -75,7 +75,19 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
         key, _, value = stripped.partition(":")
         key = key.strip()
         val = value.strip()
-        if val == "":
+        if val in (">", "|"):
+            # YAML block scalar: gather the indented lines below it. Folded
+            # (">") joins them with spaces; literal ("|") keeps newlines.
+            body_lines: List[str] = []
+            while i < len(lines):
+                nxt = lines[i]
+                if nxt.strip() and len(nxt) - len(nxt.lstrip()) == 0:
+                    break  # back to top level
+                body_lines.append(nxt.strip())
+                i += 1
+            joined = " " if val == ">" else "\n"
+            meta[key] = joined.join(body_lines).strip()
+        elif val == "":
             # Possibly a nested map: gather following indented "k: v" lines.
             submap: Dict[str, Any] = {}
             while i < len(lines):

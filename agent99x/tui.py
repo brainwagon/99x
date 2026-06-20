@@ -152,7 +152,9 @@ class AgentApp(App):
         yield Input(placeholder="Message…", id="input")
 
     def on_mount(self) -> None:
-        if not conversation.load(self.session):
+        # History was already seeded by cli._setup_context (fresh or restored);
+        # only fall back to a fresh start if something left it empty.
+        if not self.session.history:
             conversation.start(self.session)
 
         self._agent_workers: Dict[int, WorkerState] = {}
@@ -491,7 +493,7 @@ class AgentApp(App):
             old, new, _prompt_tokens, summary_tokens = autocompact_result
             self._last_usage = summary_tokens
             self._write(f"[dim]  auto-compacted: {old} → {new} messages[/dim]")
-        cli.save_session(self.session)
+        # Context is persisted on exit (on_unmount), not per turn.
         self.query_one(Input).focus()
 
     def _agent_worker(self, worker_id: int, user_snapshot: Optional[int] = None) -> None:
@@ -551,7 +553,6 @@ class AgentApp(App):
                 with self._agent_workers_lock:
                     self._agent_workers.pop(worker_id, None)
                 self._last_usage = summary_tokens
-                cli.save_session(self.session)
                 self._write(f"[dim]Compacted: {old} → {new} messages  (~{prompt_tokens:,} → ~{summary_tokens:,} tokens)[/dim]")
                 self.query_one(Input).focus()
 

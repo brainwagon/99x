@@ -2,6 +2,7 @@
 
 import json
 import os
+from typing import Optional
 
 from agent99x import config_codec
 from agent99x.session import SessionConfig, SESSION_FILE, CONFIG_FILE
@@ -28,8 +29,13 @@ def save_config(session: SessionConfig) -> None:
     os.replace(tmp, CONFIG_FILE)
 
 
-def save_session(session: SessionConfig, path: str = SESSION_FILE) -> None:
-    """Persist the message history to disk."""
+def save_session(session: SessionConfig, path: Optional[str] = None) -> None:
+    """Persist the message history to the session's context file.
+
+    Falls back to the legacy SESSION_FILE when no context has been selected.
+    """
+    if path is None:
+        path = session.context_path or SESSION_FILE
     tmp = path + ".tmp"
     with session.session_lock:
         dirpath = os.path.dirname(path)

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 AGENT_HOME: str = os.path.expanduser(os.environ.get("AGENT_HOME", "~/.99x"))
 PROJECT_DIR: str = ".99x"
 SESSION_FILE: str = os.path.join(PROJECT_DIR, "session.json")
+CONTEXTS_DIR: str = os.path.join(PROJECT_DIR, "contexts")
 CONFIG_FILE: str = os.path.join(AGENT_HOME, "config.json")
 
 # ── models ─────────────────────────────────────────────────────────
@@ -68,6 +69,10 @@ class SessionConfig:
 
     # Message history
     history: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Path to the context file this run reads from and persists to on exit.
+    # None means no context selected yet (fall back to the legacy SESSION_FILE).
+    context_path: Optional[str] = None
 
     # Active MCP clients (only populated when mcp-config.json exists)
     mcp_clients: List[Any] = field(default_factory=list, repr=False)

@@ -9,6 +9,7 @@ from agent99x import providers
 from agent99x import core
 from agent99x import compaction
 from agent99x import conversation
+from agent99x import contexts
 from agent99x.reasoning import ContentType, ThinkingRenderer
 from agent99x.session import SessionConfig, AGENT_HOME, PROJECT_DIR
 from agent99x.config_io import load_config, save_config, save_session
@@ -91,6 +92,11 @@ def init_from_argv(session: SessionConfig, argv: Optional[List[str]] = None) -> 
     parser.add_argument("--effort", choices=["low", "medium", "high"], help="Reasoning effort.")
     parser.add_argument("--autocompact", type=float, help="Autocompact threshold (0 to 1).")
     parser.add_argument("--plan", action="store_true", help="Start in plan mode.")
+    parser.add_argument(
+        "-c", "--context", nargs="?", const=contexts.LATEST, default=None, metavar="NAME",
+        help="Restore a saved context. With NAME, restore (or create) that named context; "
+             "with no value, restore the latest context for this project. "
+             "Omit -c entirely to start with a fresh context.")
     args = parser.parse_args(argv)
 
     if args.provider:
@@ -128,12 +134,42 @@ def init_from_argv(session: SessionConfig, argv: Optional[List[str]] = None) -> 
             session.provider_hosts[provider_name] = session.host
         save_config(session)
 
+    _setup_context(session, args.context)
+
     one_shot = bool(args.prompt)
     if one_shot:
         prompt = " ".join(args.prompt)
         conversation.add_user(session, prompt)
 
     return one_shot
+
+
+def _setup_context(session: SessionConfig, context_arg: Optional[str]) -> None:
+    """Pick the context file for this run and seed session.history.
+
+    ``context_arg`` is the parsed ``-c/--context`` value:
+      * None            — flag absent: start fresh in a new timestamped context.
+      * contexts.LATEST — ``-c`` with no value: restore the newest context.
+      * "<name>"        — restore the named context (or start fresh under it).
+    """
+    if context_arg is None:
+        session.context_path = contexts.new_path()
+        conversation.start(session)
+        return
+
+    if context_arg == contexts.LATEST:
+        path = contexts.latest_path()
+        if path is None:
+            print("No saved context to restore; starting fresh.", file=sys.stderr)
+            session.context_path = contexts.new_path()
+            conversation.start(session)
+            return
+    else:
+        path = contexts.path_for(context_arg)
+
+    session.context_path = path
+    if not conversation.load(session, path):
+        conversation.start(session)
 
 
 def provider_ready(session: SessionConfig) -> bool:
@@ -177,7 +213,6 @@ def repl(session: SessionConfig) -> None:
             print()
             core.agent_loop(session, on_token=on_token)
             print()
-            save_session(session)
 
         except KeyboardInterrupt:
             print("\nInterrupted.")
@@ -187,6 +222,8 @@ def repl(session: SessionConfig) -> None:
             break
         except Exception as e:
             print(f"\nError: {e}")
+
+    save_session(session)
 
 
 def _run_oneshot(session: SessionConfig) -> None:
@@ -211,6 +248,7 @@ def _run_oneshot(session: SessionConfig) -> None:
         print(f"\nError: {e}")
         sys.exit(1)
     finally:
+        save_session(session)
         _mcp_stop(session)
 
 
