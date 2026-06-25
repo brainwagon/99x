@@ -5,6 +5,7 @@ import base64
 import mimetypes
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent99x import logs
@@ -306,6 +307,18 @@ def _runtime_paths_section(session: SessionConfig) -> str:
     )
 
 
+def _environment_section() -> str:
+    """Tell the agent the current wall-clock time so 'recent'/'today' reasoning is grounded."""
+    now = datetime.now(timezone.utc).astimezone()  # local tz, carries UTC offset
+    return (
+        "# ENVIRONMENT\n\n"
+        f"- Current time: `{now.isoformat(timespec='seconds')}` "
+        f"({now.strftime('%A, %d %B %Y')})\n"
+        "- This is a snapshot taken when this turn was built, not a live clock. "
+        "For exact wall-clock time during a long task, run `date`."
+    )
+
+
 # ── user-message construction ──────────────────────────────────────
 
 ATTACH_PATH_RE = re.compile(r'attach:(\S+)')
@@ -388,6 +401,7 @@ def build_system(session: SessionConfig) -> Dict[str, Any]:
         parts.append("# ACTIVE PLAN / TODOS\n\n" + todos.strip())
 
     parts.append(_runtime_paths_section(session))
+    parts.append(_environment_section())
     parts.append(suffix)
     return {"role": "system", "content": "\n\n".join(parts)}
 
