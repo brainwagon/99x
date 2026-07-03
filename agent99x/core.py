@@ -108,7 +108,6 @@ def agent_loop(
     on_tool_result: Optional[Callable[..., None]] = None,
     on_usage: Optional[Callable[[int], None]] = None,
     on_token: Optional[Callable[[ContentType, str], None]] = None,
-    on_iteration: Optional[Callable[[int, int], None]] = None,
 ) -> Optional[str]:
     """Run the agent's main chat-completion + tool-dispatch loop."""
     tools._thread_local.cancel_event = cancel
@@ -127,8 +126,6 @@ def agent_loop(
     tool_call_repeat_count = 0
 
     for iteration_num in range(MAX_AGENT_ITERATIONS):
-        if on_iteration:
-            on_iteration(iteration_num + 1, MAX_AGENT_ITERATIONS)
         if cancel and cancel.is_set():
             return "(cancelled)"
         with session.session_lock:

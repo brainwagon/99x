@@ -47,8 +47,6 @@ class SessionConfig:
 
     context_fetched: bool = False  # Track if lazy fetch was attempted
 
-    done_grace: float = 10.0  # seconds to show finished agents in TUI
-
     # Shared state across subagent trees (e.g., call budget)
     shared_state: Dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -76,7 +74,6 @@ class SessionConfig:
 
     # Active MCP clients (only populated when mcp-config.json exists)
     mcp_clients: List[Any] = field(default_factory=list, repr=False)
-    mcp_loop: Optional[Any] = field(default=None, repr=False)
 
     # Locks for thread-safety
     session_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)

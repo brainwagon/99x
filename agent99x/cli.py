@@ -309,15 +309,3 @@ def cmd_init() -> None:
             _seed_file(dst, src)
 
     print(f"Initialized {AGENT_HOME}")
-
-
-def usage_bar(tokens: int, session: SessionConfig, width: int = 20) -> str:
-    """Return a color-coded usage bar as a string."""
-    cw = providers.ensure_context_window(session)
-    if not cw:
-        return f"{tokens} tokens"
-    pct = tokens / cw
-    filled = int(width * pct)
-    bar = "█" * min(filled, width) + "░" * max(0, width - filled)
-    color = "green" if pct < 0.7 else "yellow" if pct < 0.9 else "red"
-    return f"[{color}]{bar}[/] {tokens:,}/{cw:,} ({pct:.0%})"

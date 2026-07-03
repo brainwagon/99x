@@ -217,7 +217,6 @@ def initialize_mcp(session: Any):
     from agent99x import tools
 
     loop = get_mcp_loop()
-    session.mcp_loop = loop
 
     config_paths = ["mcp-config.json", session.agent_path("mcp-config.json")]
     config = {"mcpServers": {}}
