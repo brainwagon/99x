@@ -119,6 +119,8 @@ def agent_loop(
     last_had_error = False
     auto_continues = 0
     nudged_handback = False
+    skill_loaded_pending = False
+    nudged_skill = False
     validation_retries = 0
     MAX_VALIDATION_RETRIES = 3
 
@@ -163,6 +165,21 @@ def agent_loop(
             if last_had_error and auto_continues < 2 and content:
                 auto_continues += 1
                 messages.append({"role": "user", "content": "Please continue."})
+                continue
+
+            # Model loaded a skill but stopped with prose instead of carrying
+            # out its steps — nudge once, then let any further text through.
+            if content and skill_loaded_pending and not nudged_skill:
+                nudged_skill = True
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You loaded a skill but haven't carried out its steps yet. "
+                        "Execute the skill's steps now by calling the appropriate "
+                        "tools. Only stop and reply in text once the steps are done "
+                        "(or if you are genuinely blocked on a decision that is mine)."
+                    ),
+                })
                 continue
 
             # Model stopped with question-shaped text and no error — nudge once.
@@ -237,6 +254,14 @@ def agent_loop(
                     last_had_error = True
                 session.history.append({"role": "tool", "tool_call_id": tool_id,
                                         "content": json.dumps(result)})
+
+        # Track skills loaded but not yet acted on: a load_skill call arms the
+        # flag; any other tool call (carrying out the steps) clears it.
+        called = [tc["function"]["name"] for tc in tool_calls]
+        if any(n != "load_skill" for n in called):
+            skill_loaded_pending = False
+        elif "load_skill" in called:
+            skill_loaded_pending = True
 
         if snapshot:
             error_msg = validate_files(modified_paths)
