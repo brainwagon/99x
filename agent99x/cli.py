@@ -1,4 +1,4 @@
-"""CLI argument parsing, REPL, slash commands, session save/load."""
+"""CLI argument parsing, entry points, one-shot runner, and the plain REPL."""
 
 import argparse
 import os
@@ -10,6 +10,7 @@ from agent99x import core
 from agent99x import compaction
 from agent99x import conversation
 from agent99x import contexts
+from agent99x import commands
 from agent99x.reasoning import ContentType, ThinkingRenderer
 from agent99x.session import SessionConfig, AGENT_HOME, PROJECT_DIR
 from agent99x.hooks import AgentHooks, HookEvent
@@ -32,26 +33,80 @@ def _make_token_handler(session: SessionConfig):
     return on_token
 
 
-def _trace_hook_event(event: HookEvent) -> None:
-    """Print a concise, privacy-safe hook event to stderr."""
+class ReplyTracker:
+    """Tells whether agent_loop's returned text was already streamed.
+
+    agent_loop returns either the final model content (streamed token by
+    token through on_token during the last model request) or a loop-made
+    message that never streams: "(global call budget … exhausted)",
+    "(max iterations reached)", "(User Escalation) …". Feed it the
+    on_model_request and on_token callbacks; ``unstreamed(reply)`` returns
+    the reply if the user hasn't seen it yet, else None.
+    """
+
+    def __init__(self) -> None:
+        self._parts: List[str] = []
+
+    def on_model_request(self) -> None:
+        self._parts.clear()
+
+    def on_token(self, ctype: ContentType, text: str) -> None:
+        if ctype == ContentType.CONTENT:
+            self._parts.append(text)
+
+    def unstreamed(self, reply: Optional[str]) -> Optional[str]:
+        if not reply or reply == "(cancelled)":
+            return None
+        if reply.strip() == "".join(self._parts).strip():
+            return None
+        return reply
+
+
+# Where `99x --trace-hooks` writes in TUI mode: Textual owns the terminal
+# (and stderr) while the app runs, so the trace goes to a file instead.
+TRACE_FILE = os.path.join(PROJECT_DIR, "hook-trace.log")
+
+
+def _format_hook_event(event: HookEvent) -> str:
     parent = f" parent={event.parent_run_id[:8]}" if event.parent_run_id else ""
     details = " ".join(
         f"{key}={value}" for key, value in event.metadata.items()
         if value is not None
     )
-    print(
-        f"[hook] {event.timestamp:.3f} {event.name} "
-        f"run={event.run_id[:8]}{parent} {details}",
-        file=sys.stderr,
-        flush=True,
-    )
+    return (f"[hook] {event.timestamp:.3f} {event.name} "
+            f"run={event.run_id[:8]}{parent} {details}")
 
 
-def _cli_hooks(session: SessionConfig, hooks: Optional[AgentHooks]) -> Optional[AgentHooks]:
-    """Add the optional CLI trace handler to any programmatic handlers."""
+def _trace_hook_event(event: HookEvent) -> None:
+    """Print a concise, privacy-safe hook event to stderr."""
+    print(_format_hook_event(event), file=sys.stderr, flush=True)
+
+
+def _file_trace_handler(path: str):
+    """A trace handler that appends each event line to ``path``."""
+    def handler(event: HookEvent) -> None:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(_format_hook_event(event) + "\n")
+    return handler
+
+
+def _cli_hooks(session: SessionConfig, hooks: Optional[AgentHooks],
+               trace_path: Optional[str] = None) -> Optional[AgentHooks]:
+    """Add the optional CLI trace handler to any programmatic handlers.
+
+    The trace goes to stderr, or appended to ``trace_path`` when given (the
+    TUI passes TRACE_FILE and records the path in
+    ``session.shared_state["hook_trace_path"]`` for its startup banner).
+    """
     if not session.shared_state.pop("_trace_hooks", False):
         return hooks
-    handlers = [_trace_hook_event]
+    if trace_path is None:
+        trace = _trace_hook_event
+    else:
+        os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
+        session.shared_state["hook_trace_path"] = os.path.abspath(trace_path)
+        trace = _file_trace_handler(trace_path)
+    handlers = [trace]
     if hooks is not None:
         handlers.extend(hooks.handlers)
     return AgentHooks(handlers)
@@ -104,45 +159,65 @@ def _check_not_home_dir() -> None:
 
 # ── init ───────────────────────────────────────────────────────────
 
-def init_from_argv(session: SessionConfig, argv: Optional[List[str]] = None) -> bool:
-    """Parse CLI args and set up session. Returns True if one-shot mode."""
-    if argv is None:
-        argv = sys.argv[1:]
-    load_config(session)
-
-    parser = argparse.ArgumentParser(prog="99x", description="99x: a streamlined Python AI agent.")
+def _build_parser(prog: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog, description="99x: a streamlined Python AI agent.")
     parser.add_argument("prompt", nargs="*", help="Initial prompt (triggers one-shot mode).")
     parser.add_argument("--provider", choices=list(providers.PROVIDERS), help="LLM provider.")
     parser.add_argument("--model", help="Model ID.")
     parser.add_argument("--host", help="Host override (e.g. 10.0.0.5:11434).")
-    parser.add_argument("--effort", choices=["low", "medium", "high"], help="Reasoning effort.")
+    parser.add_argument("--effort", choices=["low", "medium", "high", "none"],
+                        help="Reasoning effort ('none' clears it).")
     parser.add_argument("--autocompact", type=float, help="Autocompact threshold (0 to 1).")
     parser.add_argument("--plan", action="store_true", help="Start in plan mode.")
     parser.add_argument(
         "--trace-hooks",
         action="store_true",
-        help="Print metadata-only lifecycle hook events to stderr.",
+        help="Trace metadata-only lifecycle hook events (to stderr for one-shot "
+             f"runs, to {TRACE_FILE} in the TUI).",
     )
     parser.add_argument(
         "-c", "--context", nargs="?", const=contexts.LATEST, default=None, metavar="NAME",
         help="Restore a saved context. With NAME, restore (or create) that named context; "
              "with no value, restore the latest context for this project. "
              "Omit -c entirely to start with a fresh context.")
+    return parser
+
+
+def init_from_argv(session: SessionConfig, argv: Optional[List[str]] = None, *,
+                   prog: str = "99x", require_prompt: bool = False) -> bool:
+    """Parse CLI args and set up session. Returns True if one-shot mode.
+
+    One-shot runs (a prompt was given) are stateless: flags apply to this
+    run only (config.json is not written), and no context file is written
+    unless ``-c`` names one to continue. Interactive runs persist the
+    provider/model/host/effort choices, as the TUI's slash commands do.
+    With ``require_prompt`` (99xsh), a missing prompt is a usage error.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    parser = _build_parser(prog)
     args = parser.parse_args(argv)
+    if require_prompt and not args.prompt:
+        parser.error("a prompt is required")
+    one_shot = bool(args.prompt)
+    persist = not one_shot
+
+    load_config(session)
 
     if args.provider:
-        session.provider = providers.PROVIDERS[args.provider]
-        if not args.host:
-            session.host = None
-        if not args.model:
-            session.model = None
-
-    if args.model:
-        session.model = args.model
-    if args.host:
-        session.host = args.host
+        # Like /provider: restore what was last used with this provider;
+        # explicit --model/--host override it.
+        name = args.provider
+        session.provider = providers.PROVIDERS[name]
+        session.model = args.model or session.provider_models.get(name)
+        session.host = args.host or session.provider_hosts.get(name)
+    else:
+        if args.model:
+            session.model = args.model
+        if args.host:
+            session.host = args.host
     if args.effort:
-        session.effort = args.effort
+        session.effort = None if args.effort == "none" else args.effort
     if args.autocompact is not None:
         session.autocompact_threshold = args.autocompact
     if args.plan:
@@ -153,7 +228,8 @@ def init_from_argv(session: SessionConfig, argv: Optional[List[str]] = None) -> 
     if session.provider:
         provider_name = session.provider.name
         try:
-            providers.setup_provider(session, provider_name, session.model, session.host)
+            commands.activate_provider(session, provider_name, session.model,
+                                       session.host, autopick=True)
         except ValueError as e:
             print(
                 f"Warning: {e}\n"
@@ -165,11 +241,11 @@ def init_from_argv(session: SessionConfig, argv: Optional[List[str]] = None) -> 
             session.provider_models[provider_name] = session.model
         if session.host is not None:
             session.provider_hosts[provider_name] = session.host
-        save_config(session)
+        if persist:
+            save_config(session)
 
-    _setup_context(session, args.context)
+    _setup_context(session, args.context, persist)
 
-    one_shot = bool(args.prompt)
     if one_shot:
         prompt = " ".join(args.prompt)
         conversation.add_user(session, prompt)
@@ -177,16 +253,19 @@ def init_from_argv(session: SessionConfig, argv: Optional[List[str]] = None) -> 
     return one_shot
 
 
-def _setup_context(session: SessionConfig, context_arg: Optional[str]) -> None:
+def _setup_context(session: SessionConfig, context_arg: Optional[str],
+                   write_new: bool = True) -> None:
     """Pick the context file for this run and seed session.history.
 
     ``context_arg`` is the parsed ``-c/--context`` value:
-      * None            — flag absent: start fresh in a new timestamped context.
+      * None            — flag absent: start fresh in a new timestamped context
+                          (or, with ``write_new=False``, in no context file at
+                          all: session.context_path stays None).
       * contexts.LATEST — ``-c`` with no value: restore the newest context.
       * "<name>"        — restore the named context (or start fresh under it).
     """
     if context_arg is None:
-        session.context_path = contexts.new_path()
+        session.context_path = contexts.new_path() if write_new else None
         conversation.start(session)
         return
 
@@ -194,7 +273,7 @@ def _setup_context(session: SessionConfig, context_arg: Optional[str]) -> None:
         path = contexts.latest_path()
         if path is None:
             print("No saved context to restore; starting fresh.", file=sys.stderr)
-            session.context_path = contexts.new_path()
+            session.context_path = contexts.new_path() if write_new else None
             conversation.start(session)
             return
     else:
@@ -215,16 +294,14 @@ def repl(session: SessionConfig, hooks: Optional[AgentHooks] = None) -> None:
     print(f"99xsh — {session.provider.name if session.provider else '(no provider)'} / {session.model}")
     if session.plan_mode:
         print("Plan mode is ON.")
-    from agent99x import commands as _commands
-    hint = _commands.model_hint(session)
+    hint = commands.model_hint(session)
     if hint:
         print(hint)
 
     if not provider_ready(session):
-        from agent99x import commands
         print(commands.prompt_for_provider(session).message)
 
-    import readline  # noqa: F401 — enables input() history if available
+    import readline  # noqa: F401  enables line editing for input()
 
     while True:
         try:
@@ -245,11 +322,8 @@ def repl(session: SessionConfig, hooks: Optional[AgentHooks] = None) -> None:
                     compaction.do_compact(session)
                 continue
 
-            conversation.add_user(session, text)
-            on_token = _make_token_handler(session)
-            print()
-            core.agent_loop(session, on_token=on_token, hooks=hooks)
-            print()
+            conversation.add_user(session, result.send_text or text)
+            _run_turn(session, hooks)
 
         except KeyboardInterrupt:
             print("\nInterrupted.")
@@ -261,6 +335,25 @@ def repl(session: SessionConfig, hooks: Optional[AgentHooks] = None) -> None:
             print(f"\nError: {e}")
 
     save_session(session)
+
+
+def _run_turn(session: SessionConfig, hooks: Optional[AgentHooks]) -> Optional[str]:
+    """Run agent_loop, streaming to stdout; print the reply if it didn't stream."""
+    tracker = ReplyTracker()
+    show = _make_token_handler(session)
+
+    def on_token(ctype, text):
+        tracker.on_token(ctype, text)
+        show(ctype, text)
+
+    print()
+    reply = core.agent_loop(session, on_model_request=tracker.on_model_request,
+                            on_token=on_token, hooks=hooks)
+    unseen = tracker.unstreamed(reply)
+    if unseen:
+        print(unseen, end="")
+    print()
+    return reply
 
 
 def _run_oneshot(
@@ -278,17 +371,16 @@ def _run_oneshot(
         sys.exit(1)
     _mcp_start(session)
     try:
-        on_token = _make_token_handler(session)
-        print()
-        core.agent_loop(session, on_token=on_token, hooks=hooks)
-        print()
+        _run_turn(session, hooks)
     except KeyboardInterrupt:
         print("\nCancelled.")
     except Exception as e:
         print(f"\nError: {e}")
         sys.exit(1)
     finally:
-        save_session(session)
+        # Stateless unless -c chose a context to continue.
+        if session.context_path is not None:
+            save_session(session)
         _mcp_stop(session)
 
 
@@ -308,7 +400,7 @@ def main_oneshot(hooks: Optional[AgentHooks] = None) -> None:
     """Entry point for `99xsh`: one-shot query, print reply, exit."""
     _check_not_home_dir()
     session = SessionConfig()
-    init_from_argv(session)
+    init_from_argv(session, prog="99xsh", require_prompt=True)
     _run_oneshot(session, hooks=_cli_hooks(session, hooks))
 
 
@@ -320,7 +412,7 @@ def main_tui(hooks: Optional[AgentHooks] = None) -> None:
     _check_not_home_dir()
     session = SessionConfig()
     one_shot = init_from_argv(session)
-    hooks = _cli_hooks(session, hooks)
+    hooks = _cli_hooks(session, hooks, trace_path=None if one_shot else TRACE_FILE)
     if one_shot:
         _run_oneshot(session, hooks=hooks)
     else:

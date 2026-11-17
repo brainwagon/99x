@@ -1,5 +1,7 @@
 """TUI application for 99x — Textual-based chat interface."""
 
+import asyncio
+import dataclasses
 import logging
 import os
 import re
@@ -19,6 +21,7 @@ from agent99x import logs
 from agent99x import cli
 from agent99x import conversation
 from agent99x import compaction
+from agent99x import commands
 from agent99x.hooks import AgentHooks
 from agent99x.reasoning import ContentType, ThinkingRenderer
 from agent99x.session import SessionConfig
@@ -37,6 +40,14 @@ class TuiLogHandler(logging.Handler):
             method(*args)
 
     def emit(self, record: logging.LogRecord):
+        try:
+            self._emit(record)
+        except Exception:
+            # Never let a UI problem (e.g. the app has exited) surface in the
+            # code that logged.
+            self.handleError(record)
+
+    def _emit(self, record: logging.LogRecord):
         msg = self.format(record)
         log_type = getattr(record, "type", None)
 
@@ -117,6 +128,16 @@ class WorkerState:
     state: str = "starting…"
     start_time: float = field(default_factory=time.monotonic)
     last_reply: str = ""
+    # "agent" (agent_loop), "compact", or "command" (a slash command's
+    # deferred network work). Esc drops compact/command workers at once
+    # (their results are discarded); agent workers stop at the next check.
+    kind: str = "agent"
+    # Set by the worker thread once it no longer touches session state.
+    done: threading.Event = field(default_factory=threading.Event)
+
+
+# How long exiting waits for cancelled workers before saving anyway.
+_EXIT_WAIT_SECONDS = 2.0
 
 
 @dataclass
@@ -153,6 +174,9 @@ class AgentApp(App):
         super().__init__(**kwargs)
         self.session = session
         self.agent_hooks = hooks
+        self._exiting = False
+        self._pricing_cache: Dict[tuple, Optional[tuple]] = {}
+        self._pricing_pending: set = set()
 
     def compose(self) -> ComposeResult:
         yield Static("", id="header")
@@ -183,26 +207,43 @@ class AgentApp(App):
 
         # Setup structured logging
         logs.setup_logging(level=logging.INFO)
-        logs.logger.addHandler(TuiLogHandler(self))
+        self._log_handler = TuiLogHandler(self)
+        logs.logger.addHandler(self._log_handler)
         for h in logs.logger.handlers:
             if isinstance(h, logging.StreamHandler) and not isinstance(h, TuiLogHandler):
                 logs.logger.removeHandler(h)
 
         self._write(_banner_markup())
         self._write("[dim]run_bash is UNSANDBOXED[/dim]")
-        from agent99x import commands as _commands
-        hint = _commands.model_hint(self.session)
-        if hint:
-            self._write(f"[dim]{escape(hint)}[/dim]")
+        trace_path = self.session.shared_state.get("hook_trace_path")
+        if trace_path:
+            self._write(f"[dim]Hook trace: {escape(trace_path)}[/dim]")
+        # model_hint may fetch OpenRouter pricing: keep it off the UI thread.
+        self.run_worker(self._startup_hint_worker, thread=True,
+                        group="startup-hint", exclusive=False)
         if len(self.session.history) > 1:
             self._write(f"[dim](resuming session, {len(self.session.history) - 1} messages)[/dim]")
         self._update_header()
         if not cli.provider_ready(self.session):
-            from agent99x import commands
             result = commands.prompt_for_provider(self.session)
             self._write(f"[dim]{escape(result.message)}[/dim]")
         self.set_interval(1 / 12, self._tick)
         self.query_one(Input).focus()
+
+    def _post(self, method, *args) -> None:
+        """call_from_thread that tolerates the app having already exited."""
+        try:
+            self.call_from_thread(method, *args)
+        except RuntimeError:
+            pass
+
+    def _startup_hint_worker(self) -> None:
+        try:
+            hint = commands.model_hint(self.session)
+        except Exception:
+            hint = None
+        if hint:
+            self._post(self._write, f"[dim]{escape(hint)}[/dim]")
 
     def handle_log_tool_call(self, name: str, args: dict) -> None:
         preview = ", ".join(f"{k}={core.clip(str(v), 40, '…')}" for k, v in args.items())
@@ -216,15 +257,20 @@ class AgentApp(App):
         self.query_one(RichLog).write(payload)
         self._log_entries.append(payload)
 
-    def _write_agent(self, reply: str, wid: Optional[int] = None) -> None:
-        """Write an agent reply, respecting the current render mode."""
+    def _write_agent(self, reply: str, wid: Optional[int] = None,
+                     run_id: Optional[int] = None) -> None:
+        """Write an agent reply, respecting the current render mode.
+
+        ``wid`` labels the reply (only shown with concurrent workers);
+        ``run_id`` is the worker id its thinking is recorded under.
+        """
         log = self.query_one(RichLog)
         header = f"\n[bold green][{wid}][/bold green]" if wid is not None else "\n"
 
-        if wid is not None and wid in self._thinking_entries:
-            thinking_text = self._thinking_entries[wid]
+        if run_id is not None and run_id in self._thinking_entries:
+            thinking_text = self._thinking_entries[run_id]
             word_count = len(thinking_text.split())
-            if wid in self._thinking_expanded:
+            if run_id in self._thinking_expanded:
                 log.write(f"[dim]▼ Thinking ({word_count} words) — Ctrl+T to collapse[/dim]")
                 log.write("\n".join(f"[dim]{line}[/dim]" for line in escape(thinking_text).split("\n")))
             else:
@@ -235,7 +281,7 @@ class AgentApp(App):
             log.write(Markdown(reply or ""))
         else:
             log.write(f"{header}{_linkify(reply or '')}")
-        self._log_entries.append(("agent", reply or "", wid))
+        self._log_entries.append(("agent", reply or "", wid, run_id))
 
     def _redraw_log(self) -> None:
         log = self.query_one(RichLog)
@@ -243,7 +289,7 @@ class AgentApp(App):
         entries, self._log_entries = self._log_entries, []
         for entry in entries:
             if isinstance(entry, tuple) and entry and entry[0] == "agent":
-                self._write_agent(entry[1], entry[2])
+                self._write_agent(*entry[1:])
             else:
                 self._write(entry)
 
@@ -312,7 +358,7 @@ class AgentApp(App):
         thinking = f"  ·  thinking:{self.session.show_thinking}"
         cost_str = ""
         if self.session.provider and self.session.provider.name == "openrouter":
-            pricing = self.session.provider.fetch_pricing(self.session)
+            pricing = self._cached_pricing()
             if pricing:
                 in_cost, out_cost = pricing
                 total_in = self.session.shared_state.get("total_input_tokens", 0)
@@ -324,6 +370,32 @@ class AgentApp(App):
         self.query_one("#header", Static).update(
             f"{self.session.provider.name if self.session.provider else '(no provider)'}  ·  {self.session.model}{ctx}{cost_str}{effort}{thinking}"
         )
+
+    def _cached_pricing(self) -> Optional[tuple]:
+        """Pricing for the current model without blocking the UI thread.
+
+        Returns the cached value, or None while a thread worker fetches it.
+        """
+        key = (self.session.provider.name, self.session.model)
+        if key in self._pricing_cache:
+            return self._pricing_cache[key]
+        if key not in self._pricing_pending:
+            self._pricing_pending.add(key)
+            provider = self.session.provider
+
+            def fetch() -> None:
+                try:
+                    value = provider.fetch_pricing(self.session)
+                except Exception:
+                    value = None
+                # Drop a result that raced a model switch; it will be refetched.
+                if (self.session.provider is provider
+                        and self.session.model == key[1]):
+                    self._pricing_cache[key] = value
+                self._pricing_pending.discard(key)
+
+            self.run_worker(fetch, thread=True, group="pricing", exclusive=False)
+        return None
 
     def _tick(self) -> None:
         self._update_header()
@@ -364,12 +436,9 @@ class AgentApp(App):
         if event.key == "escape":
             input_widget = self.query_one(Input)
             if not input_widget.has_focus or not input_widget.value.strip():
-                with self._agent_workers_lock:
-                    workers = list(self._agent_workers.values())
-                if workers:
-                    for worker_state in workers:
-                        worker_state.cancel.set()
-                        worker_state.state = "cancelling…"
+                for dropped in self._cancel_all():
+                    label = "compaction" if dropped.kind == "compact" else "command"
+                    self._write(f"[dim yellow]  ✗ {label} cancelled[/dim yellow]")
         elif event.key == "ctrl+y":
             with self._agent_workers_lock:
                 replies = [ws.last_reply for ws in self._agent_workers.values() if ws.last_reply]
@@ -378,6 +447,88 @@ class AgentApp(App):
                 self.copy_to_clipboard(reply)
                 self._notice_msg = "Copied to clipboard"
                 self._notice_until = time.monotonic() + 2.0
+
+    def _cancel_all(self) -> List[WorkerState]:
+        """Signal every worker to stop. Compaction and command workers are
+        dropped at once (their late results are discarded) and returned;
+        agent workers show "cancelling…" until agent_loop notices."""
+        dropped = []
+        with self._agent_workers_lock:
+            for wid, worker_state in list(self._agent_workers.items()):
+                worker_state.cancel.set()
+                if worker_state.kind == "agent":
+                    worker_state.state = "cancelling…"
+                else:
+                    dropped.append(self._agent_workers.pop(wid))
+        return dropped
+
+    def _register_worker(self, kind: str, state: str) -> WorkerState:
+        worker_state = WorkerState(worker_id=self._next_worker_id(),
+                                   cancel=threading.Event(), state=state, kind=kind)
+        with self._agent_workers_lock:
+            self._agent_workers[worker_state.worker_id] = worker_state
+        return worker_state
+
+    async def _graceful_exit(self) -> None:
+        """Cancel running work, give it a bounded moment to stop, then exit
+        (on_unmount saves the context)."""
+        if self._exiting:
+            return
+        self._exiting = True
+        self._cancel_all()
+        deadline = time.monotonic() + _EXIT_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            with self._agent_workers_lock:
+                running = [ws for ws in self._agent_workers.values()
+                           if not ws.done.is_set()]
+            if not running:
+                break
+            await asyncio.sleep(0.05)
+        self.exit()
+
+    async def action_quit(self) -> None:
+        await self._graceful_exit()
+
+    def _start_background(self, result: "commands.CommandResult") -> None:
+        """Run a slash command's deferred (network) work on a thread worker."""
+        job = result.background
+        worker_state = None
+        if result.background_blocks:
+            worker_state = self._register_worker(
+                "command", result.background_label or "working…")
+        self.run_worker(lambda: self._background_worker(worker_state, job),
+                        thread=True, group="command", exclusive=False)
+
+    def _background_worker(self, worker_state: Optional[WorkerState], job) -> None:
+        pending_before = self.session.pending_input_handler
+        error: Optional[str] = None
+        follow = None
+        try:
+            follow = job()
+        except Exception as e:
+            error = str(e)
+        finally:
+            if worker_state is not None:
+                worker_state.done.set()
+
+        def finish() -> None:
+            if worker_state is not None:
+                with self._agent_workers_lock:
+                    still = self._agent_workers.pop(worker_state.worker_id, None)
+                if still is None:
+                    # Cancelled with Esc: discard, and un-arm any picker it set.
+                    self.session.pending_input_handler = pending_before
+                    return
+            if error is not None:
+                self._write(f"[red]Error:[/red] {escape(error)}")
+            elif follow is not None:
+                if follow.message:
+                    self._write(f"[dim]{escape(follow.message)}[/dim]")
+                if follow.background is not None:
+                    self._start_background(follow)
+            self.query_one(Input).focus()
+
+        self._post(finish)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         try:
@@ -390,7 +541,8 @@ class AgentApp(App):
             self._saved_draft = ""
 
             self.query_one(Input).clear()
-            result = cli.handle_slash_command(self.session, text)
+            busy = self._any_busy()
+            result = cli.handle_slash_command(self.session, text, busy=busy, defer=True)
             if result.handled:
                 if result.message:
                     self._write(f"[dim]{escape(result.message)}[/dim]")
@@ -400,28 +552,31 @@ class AgentApp(App):
                 if result.clear_display:
                     self.query_one(RichLog).clear()
                     self._log_entries = []
+                    self._thinking_entries.clear()
+                    self._thinking_expanded.clear()
                 if result.compact:
                     if self._any_busy():
                         self._write("[dim]Cannot compact while an agent is running.[/dim]")
                     elif len(self.session.history) > 2:
-                        worker_id = self._next_worker_id()
-                        worker_state = WorkerState(worker_id=worker_id, cancel=threading.Event(), state="compacting…")
-                        with self._agent_workers_lock:
-                            self._agent_workers[worker_id] = worker_state
-                        self.run_worker(lambda: self._compact_worker(worker_id),
-                                        thread=True, group=f"agent-{worker_id}", exclusive=False)
+                        worker_state = self._register_worker("compact", "compacting…")
+                        self.run_worker(lambda: self._compact_worker(worker_state.worker_id),
+                                        thread=True, group=f"agent-{worker_state.worker_id}",
+                                        exclusive=False)
                     else:
                         self._write("[dim]Nothing to compact.[/dim]")
+                if result.background is not None:
+                    self._start_background(result)
                 if result.exit_app:
-                    self.exit()
+                    self.run_worker(self._graceful_exit(), group="exit", exclusive=True)
                 return
 
-            if self._any_busy():
+            if busy:
                 self._write("[dim yellow]Busy — press Esc to cancel.[/dim yellow]")
                 return
 
             snapshot = len(self.session.history)
-            media_paths, media_errors = conversation.add_user(self.session, text)
+            media_paths, media_errors = conversation.add_user(
+                self.session, result.send_text or text)
             clean_text = re.sub(r'attach:\S+', '', text).strip()
             media_tags = "  ".join(
                 f"[dim cyan]{escape('[attachment: ' + os.path.basename(p) + ']')}[/dim cyan]"
@@ -432,10 +587,8 @@ class AgentApp(App):
             for err in media_errors:
                 self._write(f"[red]{escape(err)}[/red]")
 
-            worker_id = self._next_worker_id()
-            worker_state = WorkerState(worker_id=worker_id, cancel=threading.Event())
-            with self._agent_workers_lock:
-                self._agent_workers[worker_id] = worker_state
+            worker_state = self._register_worker("agent", "starting…")
+            worker_id = worker_state.worker_id
             self.run_worker(lambda: self._agent_worker(worker_id, user_snapshot=snapshot),
                             thread=True, group=f"agent-{worker_id}", exclusive=False)
         except Exception as e:
@@ -478,8 +631,13 @@ class AgentApp(App):
         user_snapshot: Optional[int],
         ctx: _StreamCtx,
         autocompact_result,
+        unstreamed: Optional[str] = None,
     ) -> None:
-        """Clean up after agent_loop completes (runs on UI thread via call_from_thread)."""
+        """Clean up after agent_loop completes (runs on UI thread via call_from_thread).
+
+        ``unstreamed`` is the reply when agent_loop returned text that never
+        streamed (budget/iteration limits, escalations), so it must be shown.
+        """
         with self._agent_workers_lock:
             busy_count = len(self._agent_workers)
             worker_state = self._agent_workers.pop(worker_id, None)
@@ -495,15 +653,19 @@ class AgentApp(App):
             if worker_state:
                 worker_state.last_reply = reply or ""
             self._last_completed_reply = reply or ""
-            wid_for_log = worker_id if prefix else None
-            self._log_entries.append(("agent", reply or "", wid_for_log))
+            label = worker_id if prefix else None
+            self._log_entries.append(("agent", reply or "", label, worker_id))
             captured = "".join(ctx.thinking_capture)
             should_redraw = self._render_md
-            if captured and self.session.show_thinking == "full" and wid_for_log is not None:
-                self._thinking_entries[wid_for_log] = captured
+            if captured and self.session.show_thinking == "full":
+                # Record it so the redraw collapses the streamed thinking to
+                # a summary line that Ctrl+T expands.
+                self._thinking_entries[worker_id] = captured
                 should_redraw = True
             if should_redraw:
                 self._redraw_log()
+            elif unstreamed:
+                self.query_one(RichLog).write(_linkify(unstreamed))
 
             if reply:
                 match = re.search(r"\[RECOMMENDED:\s*(.+?)\]", reply)
@@ -527,6 +689,15 @@ class AgentApp(App):
             worker_state = self._agent_workers[worker_id]
 
         ctx = _StreamCtx(renderer=ThinkingRenderer(self.session.show_thinking))
+        tracker = cli.ReplyTracker()
+
+        def on_model_request() -> None:
+            tracker.on_model_request()
+            worker_state.state = "waiting for model…"
+
+        def on_token(ctype: ContentType, text: str) -> None:
+            tracker.on_token(ctype, text)
+            self._on_token(ctx, ctype, text)
 
         def on_tool_call(name: str, args: dict) -> None:
             preview = ", ".join(f"{k}={core.clip(str(v), 40, '…')}" for k, v in args.items())
@@ -552,10 +723,10 @@ class AgentApp(App):
             reply = core.agent_loop(
                 self.session,
                 cancel=worker_state.cancel,
-                on_model_request=lambda: setattr(worker_state, "state", "waiting for model…"),
+                on_model_request=on_model_request,
                 on_tool_call=on_tool_call,
                 on_usage=on_usage,
-                on_token=lambda ctype, text: self._on_token(ctx, ctype, text),
+                on_token=on_token,
                 hooks=self.agent_hooks,
             )
             if ctx.token_buffer:
@@ -572,35 +743,62 @@ class AgentApp(App):
             except Exception:
                 autocompact_result = None
 
-        self.call_from_thread(
+        unstreamed = tracker.unstreamed(reply) if agent_error is None else None
+        worker_state.done.set()
+        self._post(
             self._finish_agent_run,
             worker_id, reply, agent_error, user_snapshot, ctx, autocompact_result,
+            unstreamed,
         )
 
     def _compact_worker(self, worker_id: int) -> None:
-        try:
-            old, new, prompt_tokens, summary_tokens = compaction.do_compact(self.session)
+        """Compact a copy of the history; adopt it only if not cancelled.
 
-            def finish() -> None:
-                with self._agent_workers_lock:
-                    self._agent_workers.pop(worker_id, None)
+        do_compact is one blocking model call that Esc can't interrupt, so
+        Esc drops this worker at once (see _cancel_all) and the late result
+        is discarded instead of replacing the live history.
+        """
+        with self._agent_workers_lock:
+            worker_state = self._agent_workers.get(worker_id)
+        work = dataclasses.replace(self.session, history=list(self.session.history))
+        error: Optional[str] = None
+        stats = None
+        try:
+            stats = compaction.do_compact(work)
+        except Exception as e:
+            error = str(e)
+        finally:
+            if worker_state is not None:
+                worker_state.done.set()
+
+        def finish() -> None:
+            with self._agent_workers_lock:
+                still = self._agent_workers.pop(worker_id, None)
+            if still is None or still.cancel.is_set():
+                return  # cancelled: discard the result
+            if error is not None:
+                self._write(f"[red]Compact failed: {escape(error)}[/red]")
+            else:
+                old, new, prompt_tokens, summary_tokens = stats
+                self.session.history[:] = work.history
                 self._last_usage = summary_tokens
                 self.session.shared_state["total_input_tokens"] = self.session.shared_state.get("total_input_tokens", 0) + prompt_tokens
                 self.session.shared_state["total_output_tokens"] = self.session.shared_state.get("total_output_tokens", 0) + summary_tokens
                 self._write(f"[dim]Compacted: {old} → {new} messages  (~{prompt_tokens:,} → ~{summary_tokens:,} tokens)[/dim]")
-                self.query_one(Input).focus()
+            self.query_one(Input).focus()
 
-            self.call_from_thread(finish)
-        except Exception as e:
-            err = str(e)
-
-            def finish_err() -> None:
-                with self._agent_workers_lock:
-                    self._agent_workers.pop(worker_id, None)
-                self._write(f"[red]Compact failed: {escape(err)}[/red]")
-                self.query_one(Input).focus()
-
-            self.call_from_thread(finish_err)
+        self._post(finish)
 
     def on_unmount(self) -> None:
+        # Covers exits that bypass _graceful_exit: stop workers, give them a
+        # brief bounded chance to finish, then save what we have.
+        self._cancel_all()
+        deadline = time.monotonic() + 0.5
+        with self._agent_workers_lock:
+            running = list(self._agent_workers.values())
+        for worker_state in running:
+            worker_state.done.wait(max(0.0, deadline - time.monotonic()))
+        handler = getattr(self, "_log_handler", None)
+        if handler is not None:
+            logs.logger.removeHandler(handler)
         cli.save_session(self.session)

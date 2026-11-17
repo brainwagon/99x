@@ -2,9 +2,11 @@
 
 import json
 import os
+import tempfile
 from typing import Optional
 
 from agent99x import config_codec
+from agent99x import logs
 from agent99x.session import SessionConfig, SESSION_FILE, CONFIG_FILE
 
 
@@ -13,7 +15,10 @@ def load_config(session: SessionConfig) -> None:
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        logs.log_warning(f"could not read {CONFIG_FILE} ({e}); using defaults")
         return
     config_codec.from_dict(session, data)
     if session.provider is not None:
@@ -22,11 +27,26 @@ def load_config(session: SessionConfig) -> None:
 
 def save_config(session: SessionConfig) -> None:
     """Save session config to AGENT_HOME/config.json."""
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    tmp = CONFIG_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(config_codec.to_dict(session), indent=2))
-    os.replace(tmp, CONFIG_FILE)
+    _atomic_write(CONFIG_FILE, json.dumps(config_codec.to_dict(session), indent=2))
+
+
+def _atomic_write(path: str, text: str) -> None:
+    """Write ``text`` to ``path`` via a unique temp file in the same directory,
+    so concurrent writers never share (and clobber) one temp name."""
+    dirpath = os.path.dirname(path) or "."
+    os.makedirs(dirpath, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dirpath, prefix=os.path.basename(path) + ".",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def save_session(session: SessionConfig, path: Optional[str] = None) -> None:
@@ -36,11 +56,5 @@ def save_session(session: SessionConfig, path: Optional[str] = None) -> None:
     """
     if path is None:
         path = session.context_path or SESSION_FILE
-    tmp = path + ".tmp"
     with session.session_lock:
-        dirpath = os.path.dirname(path)
-        if dirpath:
-            os.makedirs(dirpath, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(session.history, indent=2))
-        os.replace(tmp, path)
+        _atomic_write(path, json.dumps(session.history, indent=2))

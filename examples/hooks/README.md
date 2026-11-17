@@ -16,7 +16,9 @@ run_with_usage_summary(session)
 - `usage_totals.py` aggregates model token usage and elapsed time per run.
 
 `AgentHooks` can also be passed to `cli.main_tui(hooks=...)` or
-`cli.main_oneshot(hooks=...)`; the TUI carries the same hook set into each turn.
+`cli.main_oneshot(hooks=...)`; the TUI carries the same hook set into each
+turn. For a quick look without code, `--trace-hooks` adds a built-in trace
+handler (see the main README's "Lifecycle Hook Trace").
 
 ## Event reference
 
@@ -36,8 +38,10 @@ Unix-seconds `timestamp`, and immutable `metadata`.
 
 Run statuses are `completed`, `stopped`, `cancelled`, and `failed`. Model
 request statuses are `completed`, `cancelled`, and `failed`; tool statuses are
-`completed` and `failed`. Prompts, completions, tool arguments, and tool
-results are never included.
+`completed`, `cancelled`, and `failed`. A run that is cancelled (by its
+cancel event or a `KeyboardInterrupt`) emits `run.cancelled`, and any
+in-flight model request or tool finishes with status `cancelled`. Prompts,
+completions, tool arguments, and tool results are never included.
 
 Handlers run inline, in registration order, and are serialized across worker
 threads. Parallel tool events may arrive in nondeterministic order. Keep
