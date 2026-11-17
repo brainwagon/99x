@@ -9,6 +9,7 @@ description = "A streamlined local-LLM coding agent (revised agent99)."
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.0",
+    "httpx>=0.24",
     "textual>=8.0",
     "rich>=13.0",
 ]

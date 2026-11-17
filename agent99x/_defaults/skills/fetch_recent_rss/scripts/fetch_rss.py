@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the N most recent items from an RSS 2.0 or Atom feed.
+"""Fetch the N most recent items from an RSS 2.0, RSS 1.0 (RDF) or Atom feed.
 
 Two modes, both parsing the feed here so the bulky XML never reaches the
 agent's context:
@@ -45,10 +45,28 @@ def localname(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def inner_text(elem) -> str:
+    """Element content as text. Child elements (Atom type="xhtml" content is
+    a <div> of XHTML) are serialized as markup for strip_html to flatten."""
+    parts = [elem.text or ""]
+    for child in elem:
+        parts.append(ET.tostring(child, encoding="unicode"))  # includes its tail
+    return "".join(parts).strip()
+
+
 def child_text(elem, name: str) -> str:
     for c in elem:
         if localname(c.tag) == name:
-            return (c.text or "").strip()
+            return inner_text(c)
+    return ""
+
+
+def child_plain(elem, name: str) -> str:
+    """Like child_text, but flatten XHTML markup (Atom type="xhtml") to text.
+    Plain text is returned untouched, so a title like "a < b" survives."""
+    for c in elem:
+        if localname(c.tag) == name:
+            return strip_html(inner_text(c), None) if len(c) else (c.text or "").strip()
     return ""
 
 
@@ -69,30 +87,35 @@ def atom_link(entry) -> str:
 
 
 def parse_items(root, full: bool):
-    """Return (feed_title, items) for RSS or Atom. items carry plain-text summaries."""
+    """Return (feed_title, items) for RSS 2.0, RSS 1.0 or Atom. items carry
+    plain-text summaries."""
     tag = localname(root.tag)
     limit = None if full else SUMMARY_CHARS
     items = []
 
-    if tag == "rss" or tag == "channel":
+    if tag in ("rss", "channel", "RDF"):
         channel = root if tag == "channel" else next(
             (c for c in root if localname(c.tag) == "channel"), root
         )
-        feed_title = child_text(channel, "title")
-        for it in channel:
+        feed_title = child_plain(channel, "title")
+        # RSS 2.0 nests <item>s in <channel>; RSS 1.0 (RDF) makes them
+        # siblings of <channel> under <rdf:RDF>.
+        parent = root if tag == "RDF" else channel
+        for it in parent:
             if localname(it.tag) != "item":
                 continue
             # In full mode prefer content:encoded (full article) over description.
             body = child_text(it, "encoded") if full else ""
             body = body or child_text(it, "description")
             items.append({
-                "title": child_text(it, "title"),
-                "link": child_text(it, "link"),
-                "date": child_text(it, "pubDate"),
+                "title": child_plain(it, "title"),
+                "link": child_text(it, "link") or it.attrib.get(
+                    "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about", ""),
+                "date": child_text(it, "pubDate") or child_text(it, "date"),
                 "summary": strip_html(body, limit),
             })
     elif tag == "feed":  # Atom
-        feed_title = child_text(root, "title")
+        feed_title = child_plain(root, "title")
         for it in root:
             if localname(it.tag) != "entry":
                 continue
@@ -100,13 +123,13 @@ def parse_items(root, full: bool):
             body = child_text(it, "content") if full else ""
             body = body or child_text(it, "summary") or child_text(it, "content")
             items.append({
-                "title": child_text(it, "title"),
+                "title": child_plain(it, "title"),
                 "link": atom_link(it),
                 "date": child_text(it, "published") or child_text(it, "updated"),
                 "summary": strip_html(body, limit),
             })
     else:
-        raise ValueError(f"Unrecognised feed root <{tag}> (expected rss/feed)")
+        raise ValueError(f"Unrecognised feed root <{tag}> (expected rss/RDF/feed)")
 
     return feed_title, items
 
@@ -116,7 +139,7 @@ def main(argv):
         prog="fetch_rss.py",
         description="Fetch the N most recent items from an RSS/Atom feed.",
     )
-    parser.add_argument("url", help="Feed URL (RSS 2.0 or Atom).")
+    parser.add_argument("url", help="Feed URL (RSS 2.0, RSS 1.0 or Atom).")
     parser.add_argument("-n", "--num", type=int, default=DEFAULT_N,
                         help=f"Number of items (default {DEFAULT_N}).")
     parser.add_argument("--full", action="store_true",

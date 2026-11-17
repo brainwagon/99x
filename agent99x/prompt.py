@@ -26,31 +26,170 @@ _TRUE = {"true", "yes", "on"}
 _FALSE = {"false", "no", "off"}
 
 
+def _unquote(s: str) -> Optional[str]:
+    """Return the value of a fully quoted YAML scalar, or None if unquoted."""
+    if len(s) >= 2 and s[0] == s[-1] == '"':
+        inner = s[1:-1]
+        return (inner.replace('\\"', '"').replace("\\n", "\n")
+                .replace("\\t", "\t").replace("\\\\", "\\"))
+    if len(s) >= 2 and s[0] == s[-1] == "'":
+        return s[1:-1].replace("''", "'")
+    return None
+
+
+def _split_flow_list(inner: str) -> List[str]:
+    """Split ``a, "b, c", d`` on commas that are not inside quotes."""
+    items: List[str] = []
+    buf: List[str] = []
+    quote: Optional[str] = None
+    for ch in inner:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch == ",":
+            items.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    items.append("".join(buf))
+    return [item for item in items if item.strip()]
+
+
 def _parse_scalar(raw: str) -> Any:
     s = raw.strip()
     if not s:
         return ""
+    quoted = _unquote(s)
+    if quoted is not None:
+        return quoted
     low = s.lower()
     if low in _TRUE:
         return True
     if low in _FALSE:
         return False
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        return s[1:-1]
     if s.startswith("[") and s.endswith("]"):
-        inner = s[1:-1].strip()
-        if not inner:
-            return []
-        return [_parse_scalar(item) for item in inner.split(",")]
+        return [_parse_scalar(item) for item in _split_flow_list(s[1:-1])]
     return s
+
+
+_BLOCK_HEADER_RE = re.compile(r"^([|>])([+-]?)(\d?)([+-]?)\s*(?:#.*)?$")
+_KEY_LINE_RE = re.compile(r"^[^\s#\-][^:]*:(\s|$)")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _is_list_item(stripped: str) -> bool:
+    return stripped == "-" or stripped.startswith("- ")
+
+
+def _block_scalar(style: str, chomp: str, explicit: str,
+                  lines: List[str]) -> str:
+    """Decode a ``|`` (literal) or ``>`` (folded) block scalar body."""
+    nonblank = [ln for ln in lines if ln.strip()]
+    if not nonblank:
+        return ""
+    ind = int(explicit) if explicit else _indent(nonblank[0])
+    body = [ln[ind:] if ln.strip() else "" for ln in lines]
+    trailing = 0
+    while body and body[-1] == "":
+        body.pop()
+        trailing += 1
+    if style == "|":
+        text = "\n".join(body)
+    else:
+        pieces: List[str] = []
+        for idx, line in enumerate(body):
+            prev = body[idx - 1] if idx else None
+            if prev is None or line == "" or prev == "":
+                # Empty lines stand for the newlines they represent; the
+                # break before a run of them is dropped (YAML folding).
+                pieces.append("\n" if line == "" else line)
+            elif line[0] in " \t" or prev[0] in " \t":
+                pieces.append("\n" + line)  # more-indented: not folded
+            else:
+                pieces.append(" " + line)
+        text = "".join(pieces)
+    if chomp == "-":
+        return text
+    if chomp == "+":
+        return text + "\n" * (trailing + 1)
+    return text + "\n"
+
+
+def _parse_value(val: str, child: List[str]) -> Any:
+    """Decode one key's value from its inline text and its indented lines."""
+    header = _BLOCK_HEADER_RE.match(val)
+    if header:
+        style, chomp1, digit, chomp2 = header.groups()
+        return _block_scalar(style, chomp1 or chomp2, digit, child)
+    nonblank = [ln for ln in child if ln.strip()]
+    if val:
+        if not nonblank:
+            return _parse_scalar(val)
+        # Plain or quoted scalar continued on indented lines.
+        return _parse_scalar(" ".join([val] + [ln.strip() for ln in nonblank]))
+    if not nonblank:
+        return ""
+    base = min(_indent(ln) for ln in nonblank)
+    first = nonblank[0].strip()
+    if _is_list_item(first):
+        items: List[str] = []
+        for ln in nonblank:
+            s = ln.strip()
+            if _indent(ln) == base and _is_list_item(s):
+                items.append(s[1:].strip())
+            elif items:
+                items[-1] = (items[-1] + " " + s).strip()
+        return [_parse_scalar(item) for item in items]
+    dedented = [ln[base:] if ln.strip() else "" for ln in child]
+    if any(_KEY_LINE_RE.match(ln) for ln in dedented if ln and ln[0] != " "):
+        return _parse_mapping(dedented)
+    # A plain multi-line scalar starting on the next line.
+    return _parse_scalar(" ".join(ln.strip() for ln in nonblank))
+
+
+def _parse_mapping(lines: List[str]) -> Dict[str, Any]:
+    """Parse ``key: value`` lines at indent 0, each owning its indented lines."""
+    meta: Dict[str, Any] = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        stripped = line.strip()
+        if (not stripped or stripped.startswith("#") or _indent(line) > 0
+                or ":" not in stripped):
+            continue
+        key, _, value = stripped.partition(":")
+        val = value.strip()
+        child: List[str] = []
+        while i < len(lines):
+            nxt = lines[i]
+            nxt_s = nxt.strip()
+            if (not nxt_s or _indent(nxt) > 0
+                    or (val == "" and _is_list_item(nxt_s))):
+                child.append(nxt)
+                i += 1
+                continue
+            break
+        meta[key.strip()] = _parse_value(val, child)
+    return meta
 
 
 def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     """Split YAML-ish frontmatter from body. Returns ({}, text) when none.
 
-    Handles flat ``key: value`` pairs and one level of nested map (an empty
-    value followed by indented ``key: value`` lines), so agentskills.io's
-    ``metadata:`` block parses into a dict. Deeper nesting is not supported.
+    A dependency-free subset of YAML: ``key: value`` pairs; plain, quoted,
+    and multi-line (indented continuation) scalars; inline ``[a, b]`` and
+    block (``- item``) lists; folded/literal block scalars (``>``, ``|``
+    with ``-``/``+`` chomping); and nested maps (indented ``key: value``
+    lines under an empty value), so agentskills.io's ``metadata:`` block
+    parses into a dict.
     """
     if not text.startswith("---\n") and not text.startswith("---\r\n"):
         return {}, text
@@ -64,49 +203,7 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
         after += 1
     if after < len(text) and text[after] == "\n":
         after += 1
-    meta: Dict[str, Any] = {}
-    lines = block.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        i += 1
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or ":" not in stripped:
-            continue
-        key, _, value = stripped.partition(":")
-        key = key.strip()
-        val = value.strip()
-        if val in (">", "|"):
-            # YAML block scalar: gather the indented lines below it. Folded
-            # (">") joins them with spaces; literal ("|") keeps newlines.
-            body_lines: List[str] = []
-            while i < len(lines):
-                nxt = lines[i]
-                if nxt.strip() and len(nxt) - len(nxt.lstrip()) == 0:
-                    break  # back to top level
-                body_lines.append(nxt.strip())
-                i += 1
-            joined = " " if val == ">" else "\n"
-            meta[key] = joined.join(body_lines).strip()
-        elif val == "":
-            # Possibly a nested map: gather following indented "k: v" lines.
-            submap: Dict[str, Any] = {}
-            while i < len(lines):
-                nxt = lines[i]
-                if not nxt.strip():
-                    i += 1
-                    continue
-                if len(nxt) - len(nxt.lstrip()) == 0:
-                    break  # back to top level
-                sub = nxt.strip()
-                if ":" in sub:
-                    sk, _, sv = sub.partition(":")
-                    submap[sk.strip()] = _parse_scalar(sv)
-                i += 1
-            meta[key] = submap if submap else ""
-        else:
-            meta[key] = _parse_scalar(val)
-    return meta, text[after:].lstrip("\n")
+    return _parse_mapping(block.splitlines()), text[after:].lstrip("\n")
 
 
 # ── system-prompt suffixes ─────────────────────────────────────────
@@ -139,14 +236,23 @@ _CAPABILITIES_PRIMER = (
     "call `spawn_agent(task, name)`; the agent works in its own context and returns a result.\n"
     "Decide by: do it yourself → tool; need the recipe → skill; hand it off → agent."
 )
-_PLAN_SUFFIX = (
-    "You are in PLAN MODE. "
-    "You may use read_file and run_bash with read-only commands "
-    "(ls, cat, grep, find, git log, git status, git diff, etc.) to explore the codebase. "
-    "You MUST NOT write files (write_file is disabled) or run mutating bash commands "
-    "(no rm, mv, git commit, git push, pip install, output redirections, etc.). "
-    "Describe what you would do rather than doing it."
-)
+def plan_blocked_tools() -> List[str]:
+    """Names of registered tools that plan mode disables (plan_safe=False)."""
+    return sorted(name for name, traits in tools.TOOL_TRAITS.items()
+                  if not traits.plan_safe)
+
+
+def _plan_suffix() -> str:
+    blocked = ", ".join(plan_blocked_tools()) or "file-writing tools"
+    return (
+        "You are in PLAN MODE. "
+        "You may use read_file and run_bash with read-only commands "
+        "(ls, cat, grep, find, git log, git status, git diff, etc.) to explore the codebase. "
+        f"You MUST NOT write files (these tools are disabled: {blocked}) or run mutating "
+        "bash commands (no rm, mv, git commit, git push, pip install, output "
+        "redirections, etc.). "
+        "Describe what you would do rather than doing it."
+    )
 
 
 def _read_with_mtime(path: str) -> Optional[Tuple[float, str]]:
@@ -168,7 +274,11 @@ def _read_with_mtime(path: str) -> Optional[Tuple[float, str]]:
         return None
 
 
-def _load_memory(session: SessionConfig, path: str = MEMORY_FILE) -> str:
+def _load_memory(session: SessionConfig, path: Optional[str] = None) -> str:
+    """Read a memory-style file (mtime-cached); defaults to the global MEMORY.md
+    under AGENT_HOME — the same path _runtime_paths_section advertises."""
+    if path is None:
+        path = session.agent_path(MEMORY_FILE)
     cache = session.shared_state.setdefault("memory_cache", {})
     result = _read_with_mtime(path)
     if result is None:
@@ -209,7 +319,7 @@ def _skill_meta(path: str) -> Tuple[str, str]:
         return "", ""
     meta, body = parse_frontmatter(text)
     if meta.get("description"):
-        return str(meta["description"]), body
+        return str(meta["description"]).strip(), body
     title = ""
     for line in body.splitlines():
         s = line.strip()
@@ -259,7 +369,7 @@ def _agents_catalog_lines() -> List[str]:
                 meta, _body = parse_frontmatter(f.read())
         except OSError:
             continue
-        desc = str(meta.get("description") or "")
+        desc = str(meta.get("description") or "").strip()
         lines.append(f"- {name}: {desc}" if desc else f"- {name}")
     return lines
 
@@ -377,8 +487,8 @@ def build_system(session: SessionConfig) -> Dict[str, Any]:
     _meta_proj, proj_body = _load_agent_md(session, PROJECT_AGENT_MD)
     memory = _load_memory(session)
     proj_memory = _load_memory(session, PROJECT_MEMORY_MD)
-    user_md = _load_memory(session, USER_MD_FILE)
-    suffix = _PLAN_SUFFIX if session.plan_mode else _SYSTEM_SUFFIX
+    user_md = _load_memory(session, session.agent_path(USER_MD_FILE))
+    suffix = _plan_suffix() if session.plan_mode else _SYSTEM_SUFFIX
     parts = []
     if body:
         parts.append(body)
@@ -406,13 +516,33 @@ def build_system(session: SessionConfig) -> Dict[str, Any]:
     return {"role": "system", "content": "\n\n".join(parts)}
 
 
+def effective_agent_tools(declared: Any,
+                          parent_allowed: Optional[List[str]]) -> Optional[List[str]]:
+    """The tool whitelist a subagent actually gets (None = unrestricted).
+
+    A subagent never does more than its parent: its declared
+    ``allowed_tools`` list is intersected with the parent's whitelist, or it
+    inherits the parent's when it declares none. A non-list declaration is
+    treated as none here (spawn_agent rejects it before running).
+    """
+    own = declared if isinstance(declared, list) else None
+    if parent_allowed is None:
+        return own
+    if own is None:
+        return list(parent_allowed)
+    parent = set(parent_allowed)
+    return [t for t in own if t in parent]
+
+
 def build_agent_system(
     session: SessionConfig,
     name: Optional[str] = None,
 ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
     """Build a subagent's system message and return (system_msg, frontmatter_meta).
 
-    Returns None if a named agent has no AGENT.md on disk.
+    ``session`` is the parent session: its plan mode and tool whitelist
+    shape the subagent's prompt the same way spawn_agent shapes its
+    sub-session. Returns None if a named agent has no AGENT.md on disk.
     """
     if name:
         path = scopes.resolve("agents", name)
@@ -424,12 +554,13 @@ def build_agent_system(
     parts: List[str] = []
     if body:
         parts.append(body)
-    allowed = meta.get("allowed_tools")
-    allowed_set = set(allowed) if isinstance(allowed, list) else None
-    parts.append(_build_capabilities(session, allowed_set))
+    allowed = effective_agent_tools(meta.get("allowed_tools"), session.allowed_tools)
+    parts.append(_build_capabilities(
+        session, set(allowed) if allowed is not None else None))
     if meta.get("inherit_memory"):
         memory = _load_memory(session)
         if memory:
             parts.append("# MEMORY\n\n" + memory.strip())
-    parts.append(_SYSTEM_SUFFIX)
+    # The subagent inherits the parent's plan mode (and its tool blocks).
+    parts.append(_plan_suffix() if session.plan_mode else _SYSTEM_SUFFIX)
     return {"role": "system", "content": "\n\n".join(parts)}, meta

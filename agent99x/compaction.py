@@ -11,7 +11,7 @@ def do_compact(session: SessionConfig) -> Tuple[int, int, int, int]:
     """
     history = session.history
     old_count = len(history)
-    messages = list(history)
+    messages = conversation.repair_tool_pairs(history)
     messages.append({
         "role": "user",
         "content": (
@@ -24,7 +24,7 @@ def do_compact(session: SessionConfig) -> Tuple[int, int, int, int]:
     compact_kwargs: Dict[str, Any] = dict(
         model=session.model, messages=messages,
         timeout=session.model_timeout, stream=False)
-    if session.effort:
+    if session.effort and not session.effort_suppressed:
         compact_kwargs["reasoning_effort"] = session.effort
     response = session.client.chat.completions.create(**compact_kwargs)
     summary = response.choices[0].message.content or "(empty summary)"

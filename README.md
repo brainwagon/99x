@@ -39,8 +39,25 @@ Two entry points:
 | `99xsh <prompt>` | One-shot | Single query, prints reply, exits. Stateless. |
 | `99x` | TUI | Interactive [Textual](https://textual.textualize.io/) TUI with persistent session. |
 
-Pass `--provider`, `--model`, `--host`, `--effort`, `--plan`, or `-c`/`--context`
-to either command. In the TUI, use slash commands to change these at runtime.
+Pass `--provider`, `--model`, `--host`, `--effort` (`low`, `medium`,
+`high`, or `none` to clear it), `--plan`, or `-c`/`--context` to either
+command. In the TUI, use slash commands to change these at runtime.
+At startup, known model-specific advisories and (for OpenRouter models)
+pricing may be shown.
+
+`--provider` restores the model and host last used with that provider;
+an explicit `--model`/`--host` overrides them.
+
+**Stateless one-shot runs.** `99xsh` requires a prompt (without one it
+prints usage and exits with status 2). A one-shot run (`99xsh <prompt>`,
+or `99x <prompt>`) uses its flags for that run only: it does not write
+`config.json`, and it writes no context file unless `-c` names a context
+to continue, in which case the new turn is appended to that context. The
+interactive `99x` TUI, by contrast, remembers flag and slash-command
+choices in `config.json`.
+
+Add `--trace-hooks` to trace metadata-only lifecycle events (see
+[Lifecycle Hook Trace](#lifecycle-hook-trace)).
 
 ## Three Kinds of Capability
 
@@ -73,16 +90,22 @@ See `docs/three-kinds.md` for the full design rationale.
 | `replace_lines` | Replace a contiguous line range by number (1-based, end inclusive). Use `end=start-1` to insert without deleting. |
 | `patch` | Apply a unified diff with strict context matching. |
 
+The four writing tools share one path check: the fully resolved target
+(symlinks and `..` followed) must be inside the working directory or
+`~/.99x` (`AGENT_HOME`, where the memory files live). Anything else
+returns an error and the file is not touched. `run_bash` is not
+restricted by this check.
+
 ### Shell
 | Tool | Description |
 |---|---|
-| `run_bash` | Run a bash command (30s timeout, 1 MB output cap per stream). Cancel-aware via per-thread event. |
+| `run_bash` | Run a command under `/bin/bash` (30s timeout, 1 MB output cap per stream, stdin is `/dev/null`). Returns when the shell exits; background jobs keep running. Cancel-aware via per-thread event. |
 
 ### Search
 | Tool | Description |
 |---|---|
 | `grep` | Regex search with optional path and glob filter. Uses `ripgrep` if available; falls back to Python. Up to 200 matches. |
-| `glob` | File discovery by glob pattern (e.g. `**/*.py`). Up to 500 matches. |
+| `glob` | File discovery by glob pattern. `**/` matches zero or more directories, so `**/*.py` includes top-level files; `*.py` matches only the top level. Up to 500 matches. |
 
 ### Planning
 | Tool | Description |
@@ -98,7 +121,7 @@ See `docs/three-kinds.md` for the full design rationale.
 ### Network
 | Tool | Description |
 |---|---|
-| `http_request` | HTTP client (GET/POST/PUT/PATCH/DELETE/HEAD) with configurable timeout and response body cap (default 10 MB). |
+| `http_request` | HTTP client (GET/POST/PUT/PATCH/DELETE/HEAD) with configurable timeout and response body cap (default 100 KB, set with `max_bytes`; the body is streamed and reading stops at the cap). |
 
 ### Meta (bridge tools — hidden from catalog, covered by primer)
 | Tool | Description |
@@ -115,6 +138,9 @@ Skills are pure Markdown instructions that drop into `~/.99x/skills/<name>/` (or
 `.99x/skills/<name>/` for project-local overrides). They follow the
 [agentskills.io](https://agentskills.io) `SKILL.md` convention with YAML-ish
 frontmatter (`name`, `description`, `license`, `compatibility`, `metadata`).
+The parser handles a dependency-free YAML subset: plain and quoted
+scalars, indented continuation lines, `[a, b]` and `- item` lists,
+`>`/`|` block scalars (with `-`/`+` chomping), and nested maps.
 
 **Skills do not run code.** They tell the model what to do with existing tools.
 Scripts bundled in `scripts/` are run via `run_bash` — `load_skill` returns the
@@ -153,7 +179,7 @@ for project-local overrides). The frontmatter supports:
 | `provider` | Override the provider for this agent. |
 | `host` | Override the host for this agent. |
 | `effort` | Override reasoning effort for this agent. |
-| `inherit_memory` | If truthy, the agent's system prompt includes the global MEMORY.md. |
+| `inherit_memory` | If truthy, the agent's system prompt includes the global `~/.99x/MEMORY.md`. |
 
 ## Providers
 
@@ -178,7 +204,10 @@ Gated behind an `mcp-config.json` file (project root or `~/.99x`). Requires
 
 When a config file is present, the agent starts an MCP event loop on a
 background thread, connects to each configured server over stdio, and registers
-their tools in the OpenAI function-calling format (prefixed `mcp__<server>__`).
+their tools in the OpenAI function-calling format (prefixed `mcp__<server>__`;
+names are sanitized to `[A-Za-z0-9_-]`, max 64 chars). MCP tools are blocked
+in plan mode unless the server marks them `readOnlyHint`. If a server dies,
+its tools return a "disconnected" error; there is no automatic reconnect.
 
 Global MCP tools (`mcp_list_resources`, `mcp_read_resource`, `mcp_list_prompts`,
 `mcp_get_prompt`) are always registered when MCP is active.
@@ -206,29 +235,43 @@ Available in the interactive TUI (`99x`):
 | `/provider <name>` | Switch provider (interactive model picker). |
 | `/model` | Pick a different model on the current provider. |
 | `/host [<provider> [<addr>\|clear]]` | Manage per-provider host overrides. |
-| `/effort [low\|medium\|high\|none]` | Set reasoning effort. |
-| `/thinking [off\|terse\|full]` | Toggle or set thinking display mode. |
+| `/effort [low\|medium\|high\|none]` | Set reasoning effort; with no argument, show options and current setting. |
+| `/thinking [off\|terse\|full]` | Show available modes, or set the thinking display mode. |
 | `/plan` | Toggle plan mode (blocks writes, restricts shell to read-only). |
 | `/compact` | Summarize conversation history to free context. |
-| `/budget [<n>\|unlimited]` | Show or set the global call budget. |
+| `/budget [<n>\|unlimited\|default]` | Show or set the global call budget. |
 | `/todos` | List current todos. |
 | `/todo [add\|done\|rm] <text>` | Manage todos inline. |
 | `/clear` or `/new` | Clear conversation history and screen. |
 | `/exit` or `/quit` | Exit the agent. |
 | `/cancel` | Cancel a pending interactive prompt. |
 
-Skills also appear as pseudo slash-commands — typing `/weather` runs the weather
-skill, etc.
+Skills also appear as pseudo slash-commands. `/weather Paris` sends the
+model a message that includes the `weather` skill's instructions (as
+`load_skill` would return them), tells it to carry them out now, and
+passes `Paris` as the arguments.
+
+While an agent run (or `/compact`) is in progress, commands that would
+replace the conversation history or the model client (`/clear`, `/new`,
+`/compact`, `/provider <name>`, `/model`, `/host <provider> ...`, and
+answering a model picker) are refused with a message; press Esc to cancel
+the run first. Read-only commands such as `/help` and `/budget` still
+work. Model listing for `/provider` and `/model` runs in the background,
+and Esc abandons it.
 
 ## Plan Mode
 
 Toggle with `--plan` on launch or `/plan` in the TUI. When active:
 
 - `write_file`, `edit_file`, `replace_lines`, and `patch` are blocked.
-- `run_bash` is restricted to read-only commands (pattern-matched against a
-  blocklist of mutating commands and shell constructs).
+- `run_bash` is restricted to read-only commands (checked against an
+  allowlist of read-only commands).
 - `http_request` is restricted to GET only.
+- MCP tools are blocked unless annotated `readOnlyHint: true`.
 - The system prompt instructs the model to describe rather than execute.
+  The blocked-tool list in that prompt and in `/plan`'s message comes from
+  the tool registry (every tool registered with `plan_safe=False`).
+- Subagents inherit plan mode, including its prompt and tool blocks.
 
 Useful for exploring a codebase safely or reviewing a plan before committing.
 
@@ -239,7 +282,7 @@ one context file.
 
 | Flag | Behavior |
 |---|---|
-| *(none)* | Fresh timestamped context. |
+| *(none)* | Fresh timestamped context (one-shot runs: no context file). |
 | `-c` | Restore the most recently modified context for this project. |
 | `-c <name>` | Restore (or create) the named context. |
 
@@ -258,20 +301,24 @@ Manual compaction is available via `/compact`.
 ## Call Budget
 
 A global call budget limits the total number of LLM API calls across the main
-agent and all subagents. Defaults:
+agent and all subagents. Provider defaults:
 
 - `ollama`: unlimited
 - `openrouter`: 100
 
-Set via `--effort`-like CLI flag? No — set via `/budget <n>` or
-`--call-budget` is not implemented as a CLI flag; use `/budget` in the TUI or
-set `call_budget` via config. *(Actually, there is no `--call-budget` CLI flag;
-this is configured via `/budget` slash command in the TUI.)*
+There is no CLI flag for it. Use `/budget` in the TUI: `/budget <n>` sets
+a limit, `/budget unlimited` removes the limit for every provider, and
+`/budget default` returns to the provider default. `/budget` alone shows
+calls used against the limit in effect. The choice is saved as
+`call_budget` in `config.json`: `null` (provider default), a positive
+integer, or `"unlimited"`.
 
 ## Validation
 
 After every turn where file-mutating tools run, modified files are
-syntax-checked:
+syntax-checked. Python, JSON, YAML, INI, TOML, and XML are checked
+in-process; the external checkers run with a timeout, and a missing
+checker skips the check:
 
 | Extension | Check |
 |---|---|
@@ -285,8 +332,9 @@ syntax-checked:
 | `.ini` | `configparser` |
 | `.toml` | `tomllib` (3.11+) |
 | `.xml`, `.rss` | `xml.etree.ElementTree` |
-| `.html`, `.htm` | `htmlhint` |
-| `.css` | `stylelint` |
+
+HTML and CSS are not checked: the available tools report lint and
+missing-config problems rather than syntax errors.
 
 If validation fails, the modified files are rolled back to their pre-edit
 snapshots. The agent is given up to 3 retries. On the 3rd failure, it escalates
@@ -320,14 +368,68 @@ The TUI renders thinking in dimmed text. Three display modes:
 | `terse` | First and last ~100 chars shown. |
 | `full` | All thinking shown. |
 
-Toggle with `/thinking` or set in the TUI. Persisted in `config.json`.
+Use `/thinking` to show the available modes, or `/thinking off|terse|full` to
+set one. The setting is persisted in `config.json`.
+
+In `full` mode the thinking streams as it arrives; once the reply is done
+it collapses to a one-line `▶ Thinking (N words)` summary. Ctrl+T expands
+or collapses the most recent one.
+
+## Model Compatibility
+
+The harness supports common reasoning formats and a few model-specific
+workarounds:
+
+- **Gemma 4:** Setting `--effort` or `/effort` prepends Gemma 4's `<|think|>`
+  control token to the system prompt. Reasoning is separated from the final
+  answer, including when a backend returns Gemma's channel tags or streams
+  reasoning in a `reasoning` field. The control token is added only to the
+  request, not saved in conversation history.
+- **Gemma 3:** A streaming workaround removes the family's occasional
+  mid-word newlines. It is not applied to other models, so ordinary line breaks
+  (such as numbered lists) are preserved.
+- **MiniCPM:** Tool schemas are also included in the prompt, and XML-style
+  `<function>` responses are recognized as tool calls for models or backends
+  that do not return native tool-call objects.
+
+These adaptations are selected from the model name; other models continue to
+use the normal OpenAI-compatible tool-calling and reasoning paths.
+
+## Usage and Cost Display
+
+The TUI uses reported prompt and completion token counts to track context use.
+For OpenRouter, it also fetches the selected model's published pricing and
+shows an estimated cumulative cost in the header during the session. This
+estimate depends on usage and pricing data being available; it is not shown for
+local Ollama models.
+
+## Lifecycle Hook Trace
+
+Hooks are opt-in. Run `99x --trace-hooks` for the interactive TUI or
+`99xsh --trace-hooks "your prompt"` for a one-shot trace. Events include
+run start/finish/cancel, model request timing and token counts, tool
+start/finish, and errors. Nested runs include their parent run ID. The
+trace omits prompts, completions, tool arguments, and tool results.
+
+Where the trace goes:
+
+- **One-shot** (`99xsh`, or `99x <prompt>`): stderr, so the response on
+  stdout stays separate.
+- **TUI** (`99x`): appended to `.99x/hook-trace.log` in the project,
+  because Textual owns the terminal (stderr included) while it runs. The
+  TUI prints the file's path at startup; follow it from another terminal
+  with `tail -f .99x/hook-trace.log`.
+
+Programmatic callers can still pass their own `AgentHooks` handlers; enabling
+`--trace-hooks` adds the built-in trace handler without replacing them. See
+`examples/hooks/` for reusable trace and usage-summary handlers.
 
 ## File Layout
 
 ```
 agent99x/                   # Python package (flat)
   __init__.py
-  cli.py                    # CLI parsing, REPL, slash commands, session save/load
+  cli.py                    # CLI parsing, entry points, one-shot runner
   core.py                   # Agent loop and tool dispatch
   prompt.py                 # System prompt assembly, AGENT.md parsing
   tools.py                  # Tool registry + all built-in tool primitives
@@ -377,13 +479,15 @@ agent99x/                   # Python package (flat)
 | `.99x/skills/` | Project-local skills (shadow global) |
 | `.99x/agents/` | Project-local agents (shadow global) |
 | `.99x/contexts/` | Saved conversation histories |
+| `.99x/hook-trace.log` | `99x --trace-hooks` output (TUI mode) |
 
 **Memory writing rule:** facts about the *user* go to `~/.99x/MEMORY.md`; facts
 about the *project* go to `.99x/MEMORY.md`.
 
 ## Configuration Reference
 
-`~/.99x/config.json` (persisted automatically):
+`~/.99x/config.json` (persisted automatically by the TUI; one-shot runs
+never write it). A field with the wrong type is ignored with a warning:
 
 ```json
 {
@@ -435,6 +539,8 @@ Added or refined:
 - Per-provider host overrides
 - Call budget with shared state across subagent tree
 - Handback detection and repeat-detection loop guards
+- Gemma 4 thinking support, Gemma 3 streaming workaround, and MiniCPM tool-call fallback
+- OpenRouter pricing and session cost estimate in the TUI
 
 ## License
 
