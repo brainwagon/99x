@@ -90,6 +90,12 @@ See `docs/three-kinds.md` for the full design rationale.
 | `replace_lines` | Replace a contiguous line range by number (1-based, end inclusive). Use `end=start-1` to insert without deleting. |
 | `patch` | Apply a unified diff with strict context matching. |
 
+The four writing tools share one path check: the fully resolved target
+(symlinks and `..` followed) must be inside the working directory or
+`~/.99x` (`AGENT_HOME`, where the memory files live). Anything else
+returns an error and the file is not touched. `run_bash` is not
+restricted by this check.
+
 ### Shell
 | Tool | Description |
 |---|---|

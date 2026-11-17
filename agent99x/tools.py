@@ -1052,12 +1052,37 @@ def read_file(path: str, offset: Optional[int] = None, limit: Optional[int] = No
         return {"error": f"encoding error: {e}"}
 
 
+def check_write_path(path: str) -> Optional[str]:
+    """Shared path check for every file-writing tool.
+
+    Returns an error message, or None when the fully resolved target
+    (symlinks and ``..`` followed, need not exist) is inside the current
+    working directory or AGENT_HOME. Both roots are read at call time.
+    """
+    from agent99x import session
+    try:
+        target = pathlib.Path(path).resolve()
+        roots = [pathlib.Path.cwd().resolve(),
+                 pathlib.Path(session.AGENT_HOME).resolve()]
+    except (OSError, RuntimeError, ValueError) as e:
+        return f"Security violation: cannot resolve path {path}: {e}"
+    if any(target.is_relative_to(r) for r in roots):
+        return None
+    return (f"Security violation: path {path} is outside the working directory "
+            f"({roots[0]}) and the agent home ({roots[1]}); writes are only "
+            "allowed inside those directories")
+
+
 @tool("write_file",
-      "Write (overwrite) a file on disk. Prefer edit_file for targeted changes.",
+      "Write (overwrite) a file on disk. Prefer edit_file for targeted changes. "
+      "Writes are limited to the working directory and ~/.99x.",
       group="files",
       params={"path": "string", "content": "string"},
       mutates=True, plan_safe=False)
 def write_file(path: str, content: str) -> Dict[str, Any]:
+    bad = check_write_path(path)
+    if bad:
+        return {"error": bad}
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -1068,7 +1093,8 @@ def write_file(path: str, content: str) -> Dict[str, Any]:
 
 @tool("edit_file",
       "Edit a file by replacing exact-match text. old_string must match uniquely "
-      "(or pass replace_all=true). Tolerates CRLF/LF differences and trailing-whitespace drift.",
+      "(or pass replace_all=true). Tolerates CRLF/LF differences and trailing-whitespace drift. "
+      "Writes are limited to the working directory and ~/.99x.",
       group="files",
       params={
           "path": "string",
@@ -1081,6 +1107,9 @@ def write_file(path: str, content: str) -> Dict[str, Any]:
       mutates=True, plan_safe=False)
 def edit_file(path: str, old_string: str, new_string: str,
               replace_all: bool = False) -> Dict[str, Any]:
+    bad = check_write_path(path)
+    if bad:
+        return {"error": bad}
     try:
         with open(path, encoding="utf-8", newline="") as f:
             content = f.read()
@@ -1137,7 +1166,8 @@ def edit_file(path: str, old_string: str, new_string: str,
 @tool("replace_lines",
       "Replace a contiguous range of lines in a file by line number. Lines are 1-based, end is inclusive. "
       "More robust than edit_file for small models since there is no string to match. "
-      "Use end=start-1 to insert before start without deleting anything.",
+      "Use end=start-1 to insert before start without deleting anything. "
+      "Writes are limited to the working directory and ~/.99x.",
       group="files",
       params={
           "path": "string",
@@ -1150,6 +1180,9 @@ def edit_file(path: str, old_string: str, new_string: str,
       required=["path", "start", "end", "new_content"],
       mutates=True, plan_safe=False)
 def replace_lines(path: str, start: int, end: int, new_content: str) -> Dict[str, Any]:
+    bad = check_write_path(path)
+    if bad:
+        return {"error": bad}
     try:
         with open(path, encoding="utf-8", newline="") as f:
             content = f.read()
@@ -1251,7 +1284,8 @@ def _parse_hunks(diff: str) -> Union[str, List[Dict[str, Any]]]:
 
 
 @tool("patch",
-      "Apply a unified diff (patch) to a file. Strict context matching is used.",
+      "Apply a unified diff (patch) to a file. Strict context matching is used. "
+      "Writes are limited to the working directory and ~/.99x.",
       group="files",
       params={
           "path": "string",
@@ -1261,10 +1295,10 @@ def _parse_hunks(diff: str) -> Union[str, List[Dict[str, Any]]]:
 def apply_patch(path: str, diff: str) -> Dict[str, Any]:
     """Apply a unified diff to a file. Fails if any context/deletion mismatches."""
     try:
+        bad = check_write_path(path)
+        if bad:
+            return {"error": bad}
         target_path = pathlib.Path(path).resolve()
-        cwd = pathlib.Path.cwd().resolve()
-        if not target_path.is_relative_to(cwd):
-            return {"error": f"Security violation: path {path} is outside the current working directory"}
         if not target_path.exists():
             return {"error": f"File not found: {path}"}
         with open(target_path, encoding="utf-8", newline="") as f:

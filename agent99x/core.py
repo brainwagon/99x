@@ -508,6 +508,8 @@ def _agent_loop_body(session, cancel, on_model_request, on_tool_call,
                 filepath = args.get("path")
                 if not isinstance(filepath, str) or not filepath or filepath in snapshot:
                     continue
+                if tools.check_write_path(filepath):
+                    continue  # the tool will refuse; never snapshot or roll back outside paths
                 try:
                     if os.path.exists(filepath):
                         with open(filepath, "rb") as f:
