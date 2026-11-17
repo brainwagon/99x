@@ -1,6 +1,6 @@
 ---
 name: fetch_recent_rss
-description: Fetch the N most recent items from an RSS 2.0 or Atom feed (default N=5) via a bundled script, returning a compact summary. Add --full to pull full item content when you need to reason over the feed. Use when the user gives a feed URL or asks for the latest items from a blog/news feed.
+description: Fetch the N most recent items from an RSS 2.0, RSS 1.0 (RDF) or Atom feed (default N=5) via a bundled script, returning a compact summary. Add --full to pull full item content when you need to reason over the feed. Use when the user gives a feed URL or asks for the latest items from a blog/news feed.
 ---
 
 # Fetch recent RSS / Atom items
@@ -18,7 +18,7 @@ script with `run_bash`:
 run_bash(command="python3 scripts/fetch_rss.py '<FEED URL>' [-n N] [--full]")
 ```
 
-- `<FEED URL>` — the feed's URL (RSS 2.0 or Atom; both are handled).
+- `<FEED URL>` — the feed's URL (RSS 2.0, RSS 1.0/RDF or Atom; all are handled).
 - `-n N` — optional item count. Omit to use the default of 5.
 - `--full` — emit each item's full, untruncated content instead of a short
   blurb. Use this only when the user wants to **reason over** the feed

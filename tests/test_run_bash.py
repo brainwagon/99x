@@ -41,15 +41,11 @@ def test_run_bash_truncates_large_output(in_tmp_cwd, monkeypatch):
 
 
 def test_run_bash_timeout_kills_process_group(in_tmp_cwd, monkeypatch):
-    # Mock timeout to be very short
+    monkeypatch.setattr(tools_bash, "BASH_TIMEOUT", 0.5)
     t0 = time.monotonic()
-    # We need a command that will definitely take longer than the check interval
-    result = tools_bash.run_bash("sleep 10")
-    # Note: run_bash has a hardcoded 30s timeout, we can't easily monkeypatch 
-    # the '30' inside the function without more effort, but we can verify it 
-    # returns a timeout error if we wait. 
-    # To keep tests fast, let's just verify it works with a quick command.
-    pass
+    result = tools_bash.run_bash("sleep 10 & sleep 10; wait")
+    assert result["error"] == "timeout"
+    assert time.monotonic() - t0 < 5
 
 
 def _clear_thread_local():
