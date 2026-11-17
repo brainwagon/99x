@@ -12,6 +12,7 @@ from agent99x import conversation
 from agent99x import contexts
 from agent99x.reasoning import ContentType, ThinkingRenderer
 from agent99x.session import SessionConfig, AGENT_HOME, PROJECT_DIR
+from agent99x.hooks import AgentHooks
 from agent99x.config_io import load_config, save_config, save_session
 from agent99x.commands import handle_slash_command
 
@@ -177,7 +178,7 @@ def provider_ready(session: SessionConfig) -> bool:
     return bool(session.provider and session.model)
 
 
-def repl(session: SessionConfig) -> None:
+def repl(session: SessionConfig, hooks: Optional[AgentHooks] = None) -> None:
     """A plain terminal REPL."""
     print(f"99xsh — {session.provider.name if session.provider else '(no provider)'} / {session.model}")
     if session.plan_mode:
@@ -211,7 +212,7 @@ def repl(session: SessionConfig) -> None:
             conversation.add_user(session, text)
             on_token = _make_token_handler(session)
             print()
-            core.agent_loop(session, on_token=on_token)
+            core.agent_loop(session, on_token=on_token, hooks=hooks)
             print()
 
         except KeyboardInterrupt:
@@ -226,7 +227,10 @@ def repl(session: SessionConfig) -> None:
     save_session(session)
 
 
-def _run_oneshot(session: SessionConfig) -> None:
+def _run_oneshot(
+    session: SessionConfig,
+    hooks: Optional[AgentHooks] = None,
+) -> None:
     if not provider_ready(session):
         known = ", ".join(sorted(providers.PROVIDERS))
         print(
@@ -240,7 +244,7 @@ def _run_oneshot(session: SessionConfig) -> None:
     try:
         on_token = _make_token_handler(session)
         print()
-        core.agent_loop(session, on_token=on_token)
+        core.agent_loop(session, on_token=on_token, hooks=hooks)
         print()
     except KeyboardInterrupt:
         print("\nCancelled.")
@@ -252,24 +256,27 @@ def _run_oneshot(session: SessionConfig) -> None:
         _mcp_stop(session)
 
 
-def _run_tui(session: SessionConfig) -> None:
+def _run_tui(
+    session: SessionConfig,
+    hooks: Optional[AgentHooks] = None,
+) -> None:
     from agent99x.tui import AgentApp
     _mcp_start(session)
     try:
-        AgentApp(session).run()
+        AgentApp(session, hooks=hooks).run()
     finally:
         _mcp_stop(session)
 
 
-def main_oneshot() -> None:
+def main_oneshot(hooks: Optional[AgentHooks] = None) -> None:
     """Entry point for `99xsh`: one-shot query, print reply, exit."""
     _check_not_home_dir()
     session = SessionConfig()
     init_from_argv(session)
-    _run_oneshot(session)
+    _run_oneshot(session, hooks=hooks)
 
 
-def main_tui() -> None:
+def main_tui(hooks: Optional[AgentHooks] = None) -> None:
     """Entry point for `99x`: interactive TUI."""
     if len(sys.argv) > 1 and sys.argv[1] == "init":
         cmd_init()
@@ -278,9 +285,9 @@ def main_tui() -> None:
     session = SessionConfig()
     one_shot = init_from_argv(session)
     if one_shot:
-        _run_oneshot(session)
+        _run_oneshot(session, hooks=hooks)
     else:
-        _run_tui(session)
+        _run_tui(session, hooks=hooks)
 
 
 def cmd_init() -> None:

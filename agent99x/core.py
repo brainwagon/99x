@@ -6,12 +6,14 @@ import os
 import re
 import threading
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from agent99x import logs
 from agent99x import tools  # registry + primitives (import fires registration)
 from agent99x import skills  # noqa: F401 — spawn_agent / skill tools registration
 from agent99x.config import MAX_AGENT_ITERATIONS
+from agent99x.hooks import AgentHooks, HookEvent
 from agent99x.reasoning import ContentType
 from agent99x.session import SessionConfig
 from agent99x.llm import stream_completion
@@ -71,29 +73,63 @@ def _run_tool(
     cancel: Optional[threading.Event],
     on_tool_call: Optional[Callable[..., None]],
     on_tool_result: Optional[Callable[[Dict[str, Any], float], None]],
+    hooks: Optional[AgentHooks] = None,
+    run_id: Optional[str] = None,
+    parent_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     tools._thread_local.cancel_event = cancel
     handler = tools.TOOL_HANDLERS.get(name, lambda **_: {"error": "unknown tool"})
     if on_tool_call:
         on_tool_call(name, args)
     logs.log_tool_call(name, args)
-    t0 = time.monotonic()
+    _emit_hook(hooks, "tool.started", run_id, parent_run_id, tool=name)
+    started = time.monotonic()
     blocked = _plan_mode_block_reason(session, name, args)
     if blocked:
         result_obj = {"error": blocked}
     elif session.allowed_tools is not None and name not in set(session.allowed_tools):
         result_obj = {"error": f"tool '{name}' is not permitted for this agent"}
     else:
+        previous_hook_context = getattr(tools._thread_local, "agent_hook_context", None)
+        if hooks is not None and run_id is not None:
+            tools._thread_local.agent_hook_context = (hooks, run_id)
         try:
-            if tools.needs_session(name):
-                result_obj = handler(session=session, **args)
-            else:
-                result_obj = handler(**args)
-        except Exception as e:
-            logs.logger.warning("tool '%s' raised %s: %s", name, type(e).__name__, e,
-                                exc_info=True)
-            result_obj = {"error": f"tool invocation failed: {e}"}
-    elapsed = time.monotonic() - t0
+            try:
+                if tools.needs_session(name):
+                    result_obj = handler(session=session, **args)
+                else:
+                    result_obj = handler(**args)
+            except Exception as e:
+                logs.logger.warning("tool '%s' raised %s: %s", name, type(e).__name__, e,
+                                    exc_info=True)
+                result_obj = {"error": f"tool invocation failed: {e}"}
+        finally:
+            if hooks is not None and run_id is not None:
+                if previous_hook_context is None:
+                    del tools._thread_local.agent_hook_context
+                else:
+                    tools._thread_local.agent_hook_context = previous_hook_context
+    elapsed = time.monotonic() - started
+    failed = "error" in result_obj
+    _emit_hook(
+        hooks,
+        "tool.finished",
+        run_id,
+        parent_run_id,
+        tool=name,
+        status="failed" if failed else "completed",
+        duration_seconds=elapsed,
+    )
+    if failed:
+        _emit_hook(
+            hooks,
+            "error",
+            run_id,
+            parent_run_id,
+            source="tool",
+            tool=name,
+            error_type="ToolError",
+        )
     if on_tool_result:
         on_tool_result(result_obj, elapsed)
     logs.log_tool_result(name, json.dumps(result_obj), elapsed)
@@ -108,6 +144,103 @@ def agent_loop(
     on_tool_result: Optional[Callable[..., None]] = None,
     on_usage: Optional[Callable[[int], None]] = None,
     on_token: Optional[Callable[[ContentType, str], None]] = None,
+    hooks: Optional[AgentHooks] = None,
+) -> Optional[str]:
+    """Run one agent invocation, optionally emitting metadata-only hook events."""
+    inherited = getattr(tools._thread_local, "agent_hook_context", None)
+    parent_run_id = None
+    if hooks is None and inherited is not None:
+        hooks, parent_run_id = inherited
+
+    run_id = uuid.uuid4().hex if hooks is not None else None
+    started = time.monotonic()
+    if hooks is not None and run_id is not None:
+        _emit_hook(
+            hooks,
+            "run.started",
+            run_id,
+            parent_run_id,
+            provider=session.provider.name if session.provider else None,
+            model=session.model,
+        )
+
+    status = "failed"
+    try:
+        result = _agent_loop(
+            session,
+            cancel=cancel,
+            on_model_request=on_model_request,
+            on_tool_call=on_tool_call,
+            on_tool_result=on_tool_result,
+            on_usage=on_usage,
+            on_token=on_token,
+            hooks=hooks,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+        )
+        status = _run_status(result)
+        if status == "cancelled":
+            _emit_hook(hooks, "run.cancelled", run_id, parent_run_id)
+        return result
+    except Exception as exc:
+        _emit_hook(
+            hooks,
+            "error",
+            run_id,
+            parent_run_id,
+            source="agent",
+            error_type=type(exc).__name__,
+        )
+        raise
+    finally:
+        _emit_hook(
+            hooks,
+            "run.finished",
+            run_id,
+            parent_run_id,
+            status=status,
+            duration_seconds=time.monotonic() - started,
+        )
+
+
+def _run_status(result: Optional[str]) -> str:
+    if result == "(cancelled)":
+        return "cancelled"
+    if result is None:
+        return "completed"
+    if result.startswith(("(global call budget", "(max iterations", "(User Escalation)")):
+        return "stopped"
+    return "completed"
+
+
+def _emit_hook(
+    hooks: Optional[AgentHooks],
+    name: str,
+    run_id: Optional[str],
+    parent_run_id: Optional[str],
+    **metadata: Any,
+) -> None:
+    if hooks is not None and run_id is not None:
+        hooks.emit(HookEvent(
+            name=name,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            timestamp=time.time(),
+            metadata=metadata,
+        ))
+
+
+def _agent_loop(
+    session: SessionConfig,
+    cancel: Optional[threading.Event] = None,
+    on_model_request: Optional[Callable[[], None]] = None,
+    on_tool_call: Optional[Callable[..., None]] = None,
+    on_tool_result: Optional[Callable[..., None]] = None,
+    on_usage: Optional[Callable[[int], None]] = None,
+    on_token: Optional[Callable[[ContentType, str], None]] = None,
+    hooks: Optional[AgentHooks] = None,
+    run_id: Optional[str] = None,
+    parent_run_id: Optional[str] = None,
 ) -> Optional[str]:
     """Run the agent's main chat-completion + tool-dispatch loop."""
     tools._thread_local.cancel_event = cancel
@@ -138,11 +271,43 @@ def agent_loop(
                 return f"(global call budget of {budget} exhausted)"
             session.shared_state["total_calls"] = calls + 1
 
-        if on_model_request:
-            on_model_request()
+        _emit_hook(
+            hooks,
+            "model_request.started",
+            run_id,
+            parent_run_id,
+            provider=session.provider.name if session.provider else None,
+            model=session.model,
+        )
+        request_started = time.monotonic()
+        try:
+            if on_model_request:
+                on_model_request()
+            request_started = time.monotonic()
+            content, reasoning, tool_calls, cancelled, prompt_tokens, finish_reason = stream_completion(
+                session, messages, active_tools, cancel, on_token=on_token)
+        except Exception as exc:
+            _emit_hook(
+                hooks,
+                "model_request.finished",
+                run_id,
+                parent_run_id,
+                status="failed",
+                duration_seconds=time.monotonic() - request_started,
+                error_type=type(exc).__name__,
+            )
+            raise
 
-        content, reasoning, tool_calls, cancelled, prompt_tokens, finish_reason = stream_completion(
-            session, messages, active_tools, cancel, on_token=on_token)
+        _emit_hook(
+            hooks,
+            "model_request.finished",
+            run_id,
+            parent_run_id,
+            status="cancelled" if cancelled else "completed",
+            duration_seconds=time.monotonic() - request_started,
+            input_tokens=prompt_tokens,
+            output_tokens=None,
+        )
 
         if cancelled:
             return "(cancelled)"
@@ -233,7 +398,8 @@ def agent_loop(
             except json.JSONDecodeError as e:
                 args = {"error": f"Invalid JSON in arguments: {e}"}
             result_obj = _run_tool(session, tc["function"]["name"], args,
-                                   cancel, on_tool_call, on_tool_result)
+                                   cancel, on_tool_call, on_tool_result,
+                                   hooks, run_id, parent_run_id)
             if "error" in result_obj:
                 last_had_error = True
             session.history.append({"role": "tool", "tool_call_id": tc["id"],
@@ -245,7 +411,8 @@ def agent_loop(
                 except json.JSONDecodeError as e:
                     args = {"error": f"Invalid JSON in arguments: {e}"}
                 return _run_tool(session, tc["function"]["name"], args,
-                                 cancel, on_tool_call, on_tool_result)
+                                 cancel, on_tool_call, on_tool_result,
+                                 hooks, run_id, parent_run_id)
 
             futures = [(tc["id"], _GLOBAL_EXECUTOR.submit(_task, tc)) for tc in tool_calls]
             for tool_id, fut in futures:

@@ -19,6 +19,7 @@ from agent99x import logs
 from agent99x import cli
 from agent99x import conversation
 from agent99x import compaction
+from agent99x.hooks import AgentHooks
 from agent99x.reasoning import ContentType, ThinkingRenderer
 from agent99x.session import SessionConfig
 
@@ -143,9 +144,15 @@ class AgentApp(App):
     #status { height: 1; padding: 0 1; color: $text-muted; background: $surface-darken-1; }
     """
 
-    def __init__(self, session: SessionConfig, **kwargs):
+    def __init__(
+        self,
+        session: SessionConfig,
+        hooks: Optional[AgentHooks] = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.session = session
+        self.agent_hooks = hooks
 
     def compose(self) -> ComposeResult:
         yield Static("", id="header")
@@ -527,6 +534,7 @@ class AgentApp(App):
                 on_tool_call=on_tool_call,
                 on_usage=on_usage,
                 on_token=lambda ctype, text: self._on_token(ctx, ctype, text),
+                hooks=self.agent_hooks,
             )
             if ctx.token_buffer:
                 self.call_from_thread(self._flush_lines, ["".join(ctx.token_buffer)])
