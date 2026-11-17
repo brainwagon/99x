@@ -44,6 +44,10 @@ to either command. In the TUI, use slash commands to change these at runtime.
 At startup, known model-specific advisories and (for OpenRouter models) pricing
 may be shown.
 
+Add `--trace-hooks` to either command to print metadata-only lifecycle events to
+stderr while it runs; this is useful for verifying run, model-request, and tool
+hooks without mixing trace output into the response.
+
 ## Three Kinds of Capability
 
 The agent is taught a simple decision tree for choosing how to act:
@@ -352,6 +356,19 @@ For OpenRouter, it also fetches the selected model's published pricing and
 shows an estimated cumulative cost in the header during the session. This
 estimate depends on usage and pricing data being available; it is not shown for
 local Ollama models.
+
+## Lifecycle Hook Trace
+
+Hooks are opt-in. Run `99x --trace-hooks` for the interactive TUI or
+`99xsh --trace-hooks "your prompt"` for a one-shot trace. Events include run
+start/finish, model request timing and token counts, tool start/finish, and
+errors. Nested runs include their parent run ID. The trace omits prompts,
+completions, tool arguments, and tool results; it is written to stderr so
+one-shot response output stays separate.
+
+Programmatic callers can still pass their own `AgentHooks` handlers; enabling
+`--trace-hooks` adds the built-in trace handler without replacing them. See
+`examples/hooks/` for reusable trace and usage-summary handlers.
 
 ## File Layout
 

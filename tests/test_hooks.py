@@ -247,3 +247,40 @@ def test_tui_worker_forwards_registered_hooks(monkeypatch, session):
     app._agent_worker(1)
 
     assert seen["hooks"] is hooks
+
+
+def test_cli_trace_flag_adds_safe_trace_handler_and_preserves_custom_handlers(
+    monkeypatch, capsys
+):
+    from agent99x import cli
+
+    session = SessionConfig()
+    monkeypatch.setattr(cli, "load_config", lambda _session: None)
+    monkeypatch.setattr(cli, "save_config", lambda _session: None)
+    monkeypatch.setattr(cli, "_setup_context", lambda *_args: None)
+    cli.init_from_argv(session, ["--trace-hooks"])
+
+    received = []
+    hooks = cli._cli_hooks(session, AgentHooks([received.append]))
+    assert hooks is not None
+    assert len(hooks.handlers) == 2
+
+    event = HookEvent(
+        "tool.started", "run-id-123456", None, time.time(), {"tool": "read_file"}
+    )
+    hooks.emit(event)
+
+    assert received == [event]
+    trace = capsys.readouterr().err
+    assert "[hook]" in trace
+    assert "tool.started" in trace
+    assert "tool=read_file" in trace
+    assert "run-id-123456" not in trace
+
+
+def test_cli_hooks_are_unchanged_without_trace_flag(monkeypatch):
+    from agent99x import cli
+
+    hooks = AgentHooks()
+    session = SessionConfig()
+    assert cli._cli_hooks(session, hooks) is hooks

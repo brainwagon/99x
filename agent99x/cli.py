@@ -12,7 +12,7 @@ from agent99x import conversation
 from agent99x import contexts
 from agent99x.reasoning import ContentType, ThinkingRenderer
 from agent99x.session import SessionConfig, AGENT_HOME, PROJECT_DIR
-from agent99x.hooks import AgentHooks
+from agent99x.hooks import AgentHooks, HookEvent
 from agent99x.config_io import load_config, save_config, save_session
 from agent99x.commands import handle_slash_command
 
@@ -30,6 +30,31 @@ def _make_token_handler(session: SessionConfig):
         sys.stdout.flush()
 
     return on_token
+
+
+def _trace_hook_event(event: HookEvent) -> None:
+    """Print a concise, privacy-safe hook event to stderr."""
+    parent = f" parent={event.parent_run_id[:8]}" if event.parent_run_id else ""
+    details = " ".join(
+        f"{key}={value}" for key, value in event.metadata.items()
+        if value is not None
+    )
+    print(
+        f"[hook] {event.timestamp:.3f} {event.name} "
+        f"run={event.run_id[:8]}{parent} {details}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _cli_hooks(session: SessionConfig, hooks: Optional[AgentHooks]) -> Optional[AgentHooks]:
+    """Add the optional CLI trace handler to any programmatic handlers."""
+    if not session.shared_state.pop("_trace_hooks", False):
+        return hooks
+    handlers = [_trace_hook_event]
+    if hooks is not None:
+        handlers.extend(hooks.handlers)
+    return AgentHooks(handlers)
 
 
 # ── MCP gating ─────────────────────────────────────────────────────
@@ -94,6 +119,11 @@ def init_from_argv(session: SessionConfig, argv: Optional[List[str]] = None) -> 
     parser.add_argument("--autocompact", type=float, help="Autocompact threshold (0 to 1).")
     parser.add_argument("--plan", action="store_true", help="Start in plan mode.")
     parser.add_argument(
+        "--trace-hooks",
+        action="store_true",
+        help="Print metadata-only lifecycle hook events to stderr.",
+    )
+    parser.add_argument(
         "-c", "--context", nargs="?", const=contexts.LATEST, default=None, metavar="NAME",
         help="Restore a saved context. With NAME, restore (or create) that named context; "
              "with no value, restore the latest context for this project. "
@@ -117,6 +147,8 @@ def init_from_argv(session: SessionConfig, argv: Optional[List[str]] = None) -> 
         session.autocompact_threshold = args.autocompact
     if args.plan:
         session.plan_mode = True
+    if args.trace_hooks:
+        session.shared_state["_trace_hooks"] = True
 
     if session.provider:
         provider_name = session.provider.name
@@ -277,7 +309,7 @@ def main_oneshot(hooks: Optional[AgentHooks] = None) -> None:
     _check_not_home_dir()
     session = SessionConfig()
     init_from_argv(session)
-    _run_oneshot(session, hooks=hooks)
+    _run_oneshot(session, hooks=_cli_hooks(session, hooks))
 
 
 def main_tui(hooks: Optional[AgentHooks] = None) -> None:
@@ -288,6 +320,7 @@ def main_tui(hooks: Optional[AgentHooks] = None) -> None:
     _check_not_home_dir()
     session = SessionConfig()
     one_shot = init_from_argv(session)
+    hooks = _cli_hooks(session, hooks)
     if one_shot:
         _run_oneshot(session, hooks=hooks)
     else:

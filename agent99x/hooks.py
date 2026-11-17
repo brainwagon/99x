@@ -55,6 +55,11 @@ class AgentHooks:
         self._handlers = tuple(handlers)
         self._lock = threading.Lock()
 
+    @property
+    def handlers(self) -> tuple[HookHandler, ...]:
+        """Registered handlers, in delivery order."""
+        return self._handlers
+
     def emit(self, event: HookEvent) -> None:
         """Deliver an event to every registered handler."""
         with self._lock:
