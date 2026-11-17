@@ -16,6 +16,7 @@ def test_cli_on_token_streams_to_stdout_and_stderr():
         delta = MagicMock()
         delta.content = content
         delta.reasoning_content = reasoning
+        delta.reasoning = None
         delta.tool_calls = None
         choice = MagicMock(delta=delta)
         return MagicMock(choices=[choice], usage=None)
@@ -63,6 +64,7 @@ def test_repl_streams_reasoning(mock_input, session, monkeypatch):
         delta = MagicMock()
         delta.content = content
         delta.reasoning_content = reasoning
+        delta.reasoning = None
         delta.tool_calls = None
         choice = MagicMock(delta=delta)
         return MagicMock(choices=[choice], usage=None)

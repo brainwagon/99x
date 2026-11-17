@@ -183,6 +183,10 @@ def repl(session: SessionConfig, hooks: Optional[AgentHooks] = None) -> None:
     print(f"99xsh — {session.provider.name if session.provider else '(no provider)'} / {session.model}")
     if session.plan_mode:
         print("Plan mode is ON.")
+    from agent99x import commands as _commands
+    hint = _commands.model_hint(session)
+    if hint:
+        print(hint)
 
     if not provider_ready(session):
         from agent99x import commands

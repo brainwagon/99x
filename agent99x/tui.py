@@ -190,6 +190,10 @@ class AgentApp(App):
 
         self._write(_banner_markup())
         self._write("[dim]run_bash is UNSANDBOXED[/dim]")
+        from agent99x import commands as _commands
+        hint = _commands.model_hint(self.session)
+        if hint:
+            self._write(f"[dim]{escape(hint)}[/dim]")
         if len(self.session.history) > 1:
             self._write(f"[dim](resuming session, {len(self.session.history) - 1} messages)[/dim]")
         self._update_header()
@@ -306,8 +310,19 @@ class AgentApp(App):
         else:
             effort = ""
         thinking = f"  ·  thinking:{self.session.show_thinking}"
+        cost_str = ""
+        if self.session.provider and self.session.provider.name == "openrouter":
+            pricing = self.session.provider.fetch_pricing(self.session)
+            if pricing:
+                in_cost, out_cost = pricing
+                total_in = self.session.shared_state.get("total_input_tokens", 0)
+                total_out = self.session.shared_state.get("total_output_tokens", 0)
+                cost = (total_in * in_cost / 1_000_000) + (total_out * out_cost / 1_000_000)
+                if cost > 0:
+                    cost_str = f"  ·  ${cost:.4f}"
+
         self.query_one("#header", Static).update(
-            f"{self.session.provider.name if self.session.provider else '(no provider)'}  ·  {self.session.model}{ctx}{effort}{thinking}"
+            f"{self.session.provider.name if self.session.provider else '(no provider)'}  ·  {self.session.model}{ctx}{cost_str}{effort}{thinking}"
         )
 
     def _tick(self) -> None:
@@ -501,6 +516,8 @@ class AgentApp(App):
         if autocompact_result:
             old, new, _prompt_tokens, summary_tokens = autocompact_result
             self._last_usage = summary_tokens
+            self.session.shared_state["total_input_tokens"] = self.session.shared_state.get("total_input_tokens", 0) + _prompt_tokens
+            self.session.shared_state["total_output_tokens"] = self.session.shared_state.get("total_output_tokens", 0) + summary_tokens
             self._write(f"[dim]  auto-compacted: {old} → {new} messages[/dim]")
         # Context is persisted on exit (on_unmount), not per turn.
         self.query_one(Input).focus()
@@ -515,8 +532,13 @@ class AgentApp(App):
             preview = ", ".join(f"{k}={core.clip(str(v), 40, '…')}" for k, v in args.items())
             worker_state.state = f"tool: {name}({core.clip(preview, 55, '…')})"
 
-        def on_usage(tokens: int) -> None:
-            self.call_from_thread(setattr, self, "_last_usage", tokens)
+        def on_usage(usage_tokens: tuple[int, int]) -> None:
+            p_tok, c_tok = usage_tokens
+            def _update():
+                self._last_usage = p_tok + c_tok
+                self.session.shared_state["total_input_tokens"] = self.session.shared_state.get("total_input_tokens", 0) + p_tok
+                self.session.shared_state["total_output_tokens"] = self.session.shared_state.get("total_output_tokens", 0) + c_tok
+            self.call_from_thread(_update)
 
         worker_state.state = "waiting for model…"
         with self._agent_workers_lock:
@@ -563,6 +585,8 @@ class AgentApp(App):
                 with self._agent_workers_lock:
                     self._agent_workers.pop(worker_id, None)
                 self._last_usage = summary_tokens
+                self.session.shared_state["total_input_tokens"] = self.session.shared_state.get("total_input_tokens", 0) + prompt_tokens
+                self.session.shared_state["total_output_tokens"] = self.session.shared_state.get("total_output_tokens", 0) + summary_tokens
                 self._write(f"[dim]Compacted: {old} → {new} messages  (~{prompt_tokens:,} → ~{summary_tokens:,} tokens)[/dim]")
                 self.query_one(Input).focus()
 

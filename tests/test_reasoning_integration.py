@@ -15,6 +15,7 @@ async def test_agent_loop_collects_reasoning():
         delta = MagicMock()
         delta.content = content
         delta.reasoning_content = reasoning
+        delta.reasoning = None
         delta.tool_calls = None
         choice = MagicMock(delta=delta)
         return MagicMock(choices=[choice], usage=None)
@@ -55,6 +56,7 @@ async def test_agent_loop_explicit_reasoning():
         delta = MagicMock()
         delta.content = content
         delta.reasoning_content = reasoning
+        delta.reasoning = None
         delta.tool_calls = None
         choice = MagicMock(delta=delta)
         return MagicMock(choices=[choice], usage=None)

@@ -117,6 +117,26 @@ def _cmd_todo(session: SessionConfig, arg: Optional[str] = None) -> CommandResul
 
 # ── provider / model selection (simplified) ────────────────────────
 
+def model_hint(session: SessionConfig) -> Optional[str]:
+    """One-line advisory for known model quirks, or None."""
+    model = (session.model or "").lower()
+    hints = []
+
+    if "gemma" in model and "e2b" in model:
+        from agent99x import tools
+        n = len(tools.TOOLS)
+        hints.append(f"Note: E2B-class Gemma models get unreliable at tool selection with "
+                     f"10+ tools (this agent exposes {n}). Prefer an E4B model for agentic work.")
+
+    if session.provider:
+        pricing = session.provider.fetch_pricing(session)
+        if pricing:
+            prompt, completion = pricing
+            hints.append(f"Cost per 1M tokens: ${prompt:g} input / ${completion:g} output")
+
+    return "\n".join(hints) if hints else None
+
+
 def _switch_provider(session: SessionConfig, name: str, model: str, host: Optional[str]) -> None:
     """Activate a provider/model/host triple and remember all three."""
     providers.setup_provider(session, name, model, host=host)
@@ -145,7 +165,11 @@ def _make_pick_handler(name: str, models: List[str], host: Optional[str]):
             return CommandResult(message=f"Cancelled: pick 1-{len(models)}, got {raw}.")
         picked = models[idx]
         _switch_provider(session, name, picked, host)
-        return CommandResult(message=f"Switched to {name} / {picked}.")
+        msg = f"Switched to {name} / {picked}."
+        hint = model_hint(session)
+        if hint:
+            msg += "\n" + hint
+        return CommandResult(message=msg)
     return _pick
 
 
@@ -267,9 +291,10 @@ def _cmd_host(session: SessionConfig, arg: Optional[str] = None) -> CommandResul
 
 def _cmd_effort(session: SessionConfig, arg: Optional[str] = None) -> CommandResult:
     if not arg:
+        current = session.effort or "default"
         if session.effort and session.effort_suppressed:
-            return CommandResult(message=f"Effort: {session.effort} (disabled — model does not support it)")
-        return CommandResult(message=f"Effort: {session.effort or 'default'}")
+            current = f"{session.effort} (disabled — model does not support it)"
+        return CommandResult(message=f"Effort: low|medium|high|none (current: {current})")
     val = arg.strip().lower()
     if val in ("none", "default", "off"):
         session.effort = None
@@ -306,23 +331,18 @@ def _cmd_budget(session: SessionConfig, arg: Optional[str] = None) -> CommandRes
 
 
 def _cmd_thinking(session: SessionConfig, arg: Optional[str] = None) -> CommandResult:
-    if arg:
-        val = arg.lower().strip()
-        if val in ("off", "false", "no", "0"):
-            session.show_thinking = "off"
-        elif val in ("terse", "brief", "short"):
-            session.show_thinking = "terse"
-        elif val in ("on", "full", "true", "yes", "1"):
-            session.show_thinking = "full"
-        else:
-            return CommandResult(message="Invalid argument. Use /thinking [off|terse|full].")
+    if not arg:
+        return CommandResult(message=f"Thinking: off|terse|full (current: {session.show_thinking})")
+
+    val = arg.lower().strip()
+    if val in ("off", "false", "no", "0"):
+        session.show_thinking = "off"
+    elif val in ("terse", "brief", "short"):
+        session.show_thinking = "terse"
+    elif val in ("on", "full", "true", "yes", "1"):
+        session.show_thinking = "full"
     else:
-        if session.show_thinking == "off":
-            session.show_thinking = "terse"
-        elif session.show_thinking == "terse":
-            session.show_thinking = "full"
-        else:
-            session.show_thinking = "off"
+        return CommandResult(message="Invalid argument. Use /thinking [off|terse|full].")
 
     save_config(session)
     return CommandResult(message=f"Thinking display is now {session.show_thinking}.")
@@ -346,7 +366,7 @@ _COMMANDS = {
     "model":    (_cmd_model,    "Pick a different model on the current provider."),
     "host":     (_cmd_host,     "Manage per-provider host: /host <provider> [<addr>|clear]."),
     "effort":   (_cmd_effort,   "Set reasoning effort: /effort [low|medium|high|none]."),
-    "thinking": (_cmd_thinking, "Toggle thinking display: /thinking [off|terse|full] (or cycle with no arg)."),
+    "thinking": (_cmd_thinking, "Set thinking display: /thinking [off|terse|full] (no arg shows options)."),
     "budget":   (_cmd_budget,   "Show or set the global call budget: /budget [<n>|unlimited]."),
     "cancel":   (_cmd_cancel,   "Cancel a pending interactive prompt."),
 }

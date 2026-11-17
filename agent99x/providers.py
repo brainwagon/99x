@@ -32,6 +32,10 @@ class Provider:
         """Return the active model's context-window size, or 0 if unknown."""
         return 0
 
+    def fetch_pricing(self, session: "SessionConfig") -> Optional[tuple[float, float]]:
+        """Return the active model's (input, output) cost per 1M tokens, or None if unknown."""
+        return None
+
 
 def _apply_host(base_url: str, host: Optional[str]) -> str:
     """Substitute `host` for the netloc of `base_url`. Returns base_url unchanged if host is falsy."""
@@ -66,14 +70,45 @@ class OpenRouterProvider(Provider):
     base_url = "https://openrouter.ai/api/v1"
     api_key = os.getenv("OPENROUTER_API_KEY", "")
 
-    def fetch_context_window(self, session):
+    def __init__(self):
+        self._cached_pricing = {}
+
+    def _fetch_model_data(self, session) -> Optional[dict]:
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        with httpx.Client(timeout=session.http_timeout) as c:
-            data = c.get(f"{session.base_url}/models", headers=headers).json()
-        for m in data.get("data", []):
-            if m["id"] == session.model:
-                return int(m.get("context_length", 0))
+        try:
+            with httpx.Client(timeout=session.http_timeout) as c:
+                data = c.get(f"{session.base_url}/models", headers=headers).json()
+            for m in data.get("data", []):
+                if m["id"] == session.model:
+                    return m
+        except Exception as e:
+            logs.log_warning(f"could not fetch openrouter model data: {e}")
+        return None
+
+    def fetch_context_window(self, session):
+        m = self._fetch_model_data(session)
+        if m:
+            return int(m.get("context_length", 0))
         return 0
+
+    def fetch_pricing(self, session) -> Optional[tuple[float, float]]:
+        if session.model in self._cached_pricing:
+            return self._cached_pricing[session.model]
+
+        m = self._fetch_model_data(session)
+        if m and "pricing" in m:
+            pricing = m["pricing"]
+            try:
+                # OpenRouter returns pricing per 1 token
+                prompt = float(pricing.get("prompt", 0)) * 1_000_000
+                completion = float(pricing.get("completion", 0)) * 1_000_000
+                self._cached_pricing[session.model] = (prompt, completion)
+                return (prompt, completion)
+            except (ValueError, TypeError):
+                pass
+
+        self._cached_pricing[session.model] = None
+        return None
 
 
 PROVIDERS: Dict[str, Provider] = {

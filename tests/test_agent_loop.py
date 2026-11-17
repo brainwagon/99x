@@ -25,7 +25,7 @@ def test_agent_loop_reports_usage_via_callback(session, fake_lm):
     seen = []
     session.history = [{"role": "user", "content": "hi"}]
     core.agent_loop(session, on_usage=seen.append)
-    assert seen == [99]
+    assert seen == [(99, 0)]
 
 
 def test_agent_loop_dispatches_tool_call(session, fake_lm, in_tmp_cwd):

@@ -142,7 +142,7 @@ def agent_loop(
     on_model_request: Optional[Callable[[], None]] = None,
     on_tool_call: Optional[Callable[..., None]] = None,
     on_tool_result: Optional[Callable[..., None]] = None,
-    on_usage: Optional[Callable[[int], None]] = None,
+    on_usage: Optional[Callable[[tuple[int, int]], None]] = None,
     on_token: Optional[Callable[[ContentType, str], None]] = None,
     hooks: Optional[AgentHooks] = None,
 ) -> Optional[str]:
@@ -236,7 +236,7 @@ def _agent_loop(
     on_model_request: Optional[Callable[[], None]] = None,
     on_tool_call: Optional[Callable[..., None]] = None,
     on_tool_result: Optional[Callable[..., None]] = None,
-    on_usage: Optional[Callable[[int], None]] = None,
+    on_usage: Optional[Callable[[tuple[int, int]], None]] = None,
     on_token: Optional[Callable[[ContentType, str], None]] = None,
     hooks: Optional[AgentHooks] = None,
     run_id: Optional[str] = None,
@@ -284,7 +284,7 @@ def _agent_loop(
             if on_model_request:
                 on_model_request()
             request_started = time.monotonic()
-            content, reasoning, tool_calls, cancelled, prompt_tokens, finish_reason = stream_completion(
+            content, reasoning, tool_calls, cancelled, usage_tokens, finish_reason = stream_completion(
                 session, messages, active_tools, cancel, on_token=on_token)
         except Exception as exc:
             _emit_hook(
@@ -305,14 +305,14 @@ def _agent_loop(
             parent_run_id,
             status="cancelled" if cancelled else "completed",
             duration_seconds=time.monotonic() - request_started,
-            input_tokens=prompt_tokens,
-            output_tokens=None,
+            input_tokens=usage_tokens[0] if usage_tokens else None,
+            output_tokens=usage_tokens[1] if usage_tokens else None,
         )
 
         if cancelled:
             return "(cancelled)"
-        if prompt_tokens and on_usage:
-            on_usage(prompt_tokens)
+        if usage_tokens and on_usage:
+            on_usage(usage_tokens)
 
         assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content or ""}
         if tool_calls:

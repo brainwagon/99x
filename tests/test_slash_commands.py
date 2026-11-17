@@ -82,6 +82,16 @@ def test_plan_command_toggles(session):
     assert session.plan_mode is False
 
 
+def test_thinking_without_argument_shows_modes_without_toggling(session):
+    session.show_thinking = "full"
+
+    result = handle_slash_command(session, "/thinking")
+
+    assert "off|terse|full" in result.message
+    assert "current: full" in result.message
+    assert session.show_thinking == "full"
+
+
 def test_provider_no_args_shows_current_and_known(session):
     result = handle_slash_command(session, "/provider")
     assert result.handled is True
@@ -325,5 +335,4 @@ def test_host_clear_for_current_provider(session, monkeypatch):
     assert setup_calls == [("ollama", "google/gemma-4-e4b", None)]
     assert session.host is None
     assert "applied now" in result.message
-
 

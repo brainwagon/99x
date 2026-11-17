@@ -41,6 +41,8 @@ Two entry points:
 
 Pass `--provider`, `--model`, `--host`, `--effort`, `--plan`, or `-c`/`--context`
 to either command. In the TUI, use slash commands to change these at runtime.
+At startup, known model-specific advisories and (for OpenRouter models) pricing
+may be shown.
 
 ## Three Kinds of Capability
 
@@ -206,8 +208,8 @@ Available in the interactive TUI (`99x`):
 | `/provider <name>` | Switch provider (interactive model picker). |
 | `/model` | Pick a different model on the current provider. |
 | `/host [<provider> [<addr>\|clear]]` | Manage per-provider host overrides. |
-| `/effort [low\|medium\|high\|none]` | Set reasoning effort. |
-| `/thinking [off\|terse\|full]` | Toggle or set thinking display mode. |
+| `/effort [low\|medium\|high\|none]` | Set reasoning effort; with no argument, show options and current setting. |
+| `/thinking [off\|terse\|full]` | Show available modes, or set the thinking display mode. |
 | `/plan` | Toggle plan mode (blocks writes, restricts shell to read-only). |
 | `/compact` | Summarize conversation history to free context. |
 | `/budget [<n>\|unlimited]` | Show or set the global call budget. |
@@ -320,7 +322,36 @@ The TUI renders thinking in dimmed text. Three display modes:
 | `terse` | First and last ~100 chars shown. |
 | `full` | All thinking shown. |
 
-Toggle with `/thinking` or set in the TUI. Persisted in `config.json`.
+Use `/thinking` to show the available modes, or `/thinking off|terse|full` to
+set one. The setting is persisted in `config.json`.
+
+## Model Compatibility
+
+The harness supports common reasoning formats and a few model-specific
+workarounds:
+
+- **Gemma 4:** Setting `--effort` or `/effort` prepends Gemma 4's `<|think|>`
+  control token to the system prompt. Reasoning is separated from the final
+  answer, including when a backend returns Gemma's channel tags or streams
+  reasoning in a `reasoning` field. The control token is added only to the
+  request, not saved in conversation history.
+- **Gemma 3:** A streaming workaround removes the family's occasional
+  mid-word newlines. It is not applied to other models, so ordinary line breaks
+  (such as numbered lists) are preserved.
+- **MiniCPM:** Tool schemas are also included in the prompt, and XML-style
+  `<function>` responses are recognized as tool calls for models or backends
+  that do not return native tool-call objects.
+
+These adaptations are selected from the model name; other models continue to
+use the normal OpenAI-compatible tool-calling and reasoning paths.
+
+## Usage and Cost Display
+
+The TUI uses reported prompt and completion token counts to track context use.
+For OpenRouter, it also fetches the selected model's published pricing and
+shows an estimated cumulative cost in the header during the session. This
+estimate depends on usage and pricing data being available; it is not shown for
+local Ollama models.
 
 ## File Layout
 
@@ -435,6 +466,8 @@ Added or refined:
 - Per-provider host overrides
 - Call budget with shared state across subagent tree
 - Handback detection and repeat-detection loop guards
+- Gemma 4 thinking support, Gemma 3 streaming workaround, and MiniCPM tool-call fallback
+- OpenRouter pricing and session cost estimate in the TUI
 
 ## License
 
