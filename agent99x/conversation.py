@@ -29,10 +29,57 @@ def load(session: SessionConfig, path: str = SESSION_FILE) -> bool:
     except json.JSONDecodeError as e:
         logs.log_warning(f"session file at {path} is corrupt ({e}); starting fresh")
         return False
+    if not isinstance(history, list):
+        logs.log_warning(f"session file at {path} is not a message list; starting fresh")
+        return False
     if history:
         history[0] = build_system(session)
-    session.history = history
+    session.history = repair_tool_pairs(history)
     return True
+
+
+_MISSING_RESULT = json.dumps(
+    {"error": "cancelled: no result was recorded for this tool call"})
+
+
+def repair_tool_pairs(messages: list) -> list:
+    """Return messages with every assistant tool call paired with a result.
+
+    The chat API rejects a transcript where an assistant ``tool_calls``
+    entry has no following ``tool`` message (or a ``tool`` message answers
+    no preceding call); an interrupted run or an old saved context can
+    leave one behind.  This inserts a placeholder error result for each
+    unanswered call id and drops tool messages whose id has no call
+    immediately before them, or that answer an id twice.  Returns a new
+    list that reuses the original message dicts; ``messages`` is untouched.
+    """
+    out: list = []
+    pending: list = []  # call ids of the latest assistant turn still unanswered
+
+    def close_pending() -> None:
+        for call_id in pending:
+            out.append({"role": "tool", "tool_call_id": call_id,
+                        "content": _MISSING_RESULT})
+        pending.clear()
+
+    for msg in messages:
+        role = msg.get("role") if isinstance(msg, dict) else None
+        if role == "tool":
+            call_id = msg.get("tool_call_id")
+            if call_id in pending:
+                pending.remove(call_id)
+                out.append(msg)
+            # else: orphan or duplicate result -- drop it
+            continue
+        close_pending()
+        out.append(msg)
+        if role == "assistant":
+            for tc in msg.get("tool_calls") or ():
+                call_id = tc.get("id") if isinstance(tc, dict) else None
+                if call_id and call_id not in pending:
+                    pending.append(call_id)
+    close_pending()
+    return out
 
 
 def clear(session: SessionConfig) -> None:

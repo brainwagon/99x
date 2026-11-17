@@ -6,6 +6,7 @@ agent99x ships two providers: ollama (local default) and openrouter (remote).
 """
 
 import math
+import re
 import os
 import urllib.parse
 from typing import Dict, List, Optional
@@ -59,6 +60,11 @@ class OllamaProvider(Provider):
         base = session.base_url.rsplit("/v1", 1)[0]
         with httpx.Client(timeout=session.http_timeout) as c:
             data = c.post(f"{base}/api/show", json={"model": session.model}).json()
+        # The model's configured num_ctx (Modelfile PARAMETER) is the window
+        # ollama actually serves; context_length is only what it was trained on.
+        m = re.search(r"^\s*num_ctx\s+(\d+)", data.get("parameters") or "", re.MULTILINE)
+        if m:
+            return int(m.group(1))
         for k, v in data.get("model_info", {}).items():
             if k.endswith(".context_length"):
                 return int(v)

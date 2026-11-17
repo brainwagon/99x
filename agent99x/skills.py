@@ -14,7 +14,8 @@ from agent99x import providers
 from agent99x import scopes
 from agent99x import tools
 from agent99x.config import MAX_AGENT_DEPTH
-from agent99x.prompt import _skill_meta, build_agent_system, parse_frontmatter
+from agent99x.prompt import (_skill_meta, build_agent_system,
+                             effective_agent_tools, parse_frontmatter)
 from agent99x.session import SessionConfig
 from agent99x.tools import tool
 
@@ -99,16 +100,26 @@ def spawn_agent(task: str, name: Optional[str] = None,
     allowed = meta.get("allowed_tools")
     if allowed is not None and not isinstance(allowed, list):
         return {"error": f"Agent '{name}' has invalid allowed_tools (expected list)."}
+    # Same rule the prompt's catalog uses, so the two can't drift apart.
+    allowed = effective_agent_tools(allowed, session.allowed_tools)
 
     sub_session = SessionConfig(
         provider=session.provider,
         model=session.model,
         host=session.host,
         effort=session.effort,
+        effort_suppressed=session.effort_suppressed,
+        call_budget=session.call_budget,
         context_window=session.context_window,
         model_timeout=session.model_timeout,
+        http_timeout=session.http_timeout,
+        plan_mode=session.plan_mode,
         client=session.client,
         shared_state=session.shared_state,
+        # One lock per agent tree so the shared call-budget check is atomic
+        # across parallel subagents.
+        session_lock=session.session_lock,
+        mcp_clients=session.mcp_clients,
         allowed_tools=allowed,
         history=[system, {"role": "user", "content": task}],
     )
@@ -129,12 +140,18 @@ def spawn_agent(task: str, name: Optional[str] = None,
             return {"error": f"Agent '{name}' provider override failed: {e}"}
     elif ov_model:
         sub_session.model = ov_model
+    if ((sub_session.provider, sub_session.host, sub_session.model)
+            != (session.provider, session.host, session.model)):
+        sub_session.effort_suppressed = False  # a different model may accept it
     if ov_effort:
         sub_session.effort = ov_effort
 
     prev = depth
     tools._thread_local.depth = depth + 1
     try:
-        return {"result": agent_loop(sub_session)}
+        # _run_tool set the parent's cancel event on this thread; pass it on
+        # so cancelling the parent also stops the subagent.
+        cancel = getattr(tools._thread_local, "cancel_event", None)
+        return {"result": agent_loop(sub_session, cancel=cancel)}
     finally:
         tools._thread_local.depth = prev

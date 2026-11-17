@@ -53,7 +53,8 @@ class AgentHooks:
 
     def __init__(self, handlers: Iterable[HookHandler] = ()) -> None:
         self._handlers = tuple(handlers)
-        self._lock = threading.Lock()
+        # Reentrant so a handler that emits an event can't deadlock itself.
+        self._lock = threading.RLock()
 
     @property
     def handlers(self) -> tuple[HookHandler, ...]:
